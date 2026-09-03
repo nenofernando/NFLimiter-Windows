@@ -34,6 +34,7 @@ void LimiterEngine::prepare(double sampleRate, int maximumBlockSize, int newNumC
     for (auto& cs : channelState)
     {
         cs.delay.assign((size_t) delayCapacity, 0.0f);
+        cs.dryDelay.assign((size_t) delayCapacity, 0.0f);
         cs.minIdxRing.assign((size_t) minRingCapacity, (juce::int64) 0);
         cs.minValRing.assign((size_t) minRingCapacity, 0.0f);
     }
@@ -45,9 +46,11 @@ void LimiterEngine::prepare(double sampleRate, int maximumBlockSize, int newNumC
     inputGainSmoothed.reset(baseSampleRate, 0.02);
     ceilingSmoothed.reset(baseSampleRate, 0.02);
     stereoLinkSmoothed.reset(baseSampleRate, 0.02);
+    bypassMix.reset(baseSampleRate, 0.006);
     inputGainSmoothed.setCurrentAndTargetValue(1.0f);
     ceilingSmoothed.setCurrentAndTargetValue(0.89125f);
     stereoLinkSmoothed.setCurrentAndTargetValue(1.0f);
+    bypassMix.setCurrentAndTargetValue(0.0f);
 
     reset();
 }
@@ -58,6 +61,7 @@ void LimiterEngine::reset()
     for (auto& cs : channelState)
     {
         std::fill(cs.delay.begin(), cs.delay.end(), 0.0f);
+        std::fill(cs.dryDelay.begin(), cs.dryDelay.end(), 0.0f);
         cs.minHead = 0; cs.minCount = 0; cs.currentGain = 1.0f; cs.heldDigitalPeak = 0.0f;
     }
     for (auto& os : oversamplers) if (os) os->reset();
@@ -74,6 +78,7 @@ void LimiterEngine::switchToPendingFactorIfNeeded()
     for (auto& cs : channelState)
     {
         std::fill(cs.delay.begin(), cs.delay.end(), 0.0f);
+        std::fill(cs.dryDelay.begin(), cs.dryDelay.end(), 0.0f);
         cs.minHead = 0; cs.minCount = 0; cs.currentGain = 1.0f; cs.heldDigitalPeak = 0.0f;
     }
     const int idx = factorToIndex(wanted);
@@ -83,6 +88,7 @@ void LimiterEngine::switchToPendingFactorIfNeeded()
     inputGainSmoothed.reset(osRate, 0.02);
     ceilingSmoothed.reset(osRate, 0.02);
     stereoLinkSmoothed.reset(osRate, 0.02);
+    bypassMix.reset(osRate, 0.006);
 }
 
 void LimiterEngine::setParameters(float inputGainDb, float ceilingDbTP, float releaseMsIn, bool autoReleaseIn,
@@ -172,16 +178,24 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
         const float gainNow = inputGainSmoothed.getNextValue();
         const float ceilNow = ceilingSmoothed.getNextValue();
         const float linkNow = stereoLinkSmoothed.getNextValue();
+        // Bypass is a request, not an instant switch: crossfade the output between the
+        // dry and wet paths over a few ms so toggling it never clicks.
+        bypassMix.setTargetValue(bypassed ? 1.0f : 0.0f);
+        const float mixToDry = bypassMix.getNextValue();
 
         float peak[2] { 0.0f, 0.0f };
         for (int ch = 0; ch < chans; ++ch)
         {
             auto& cs = channelState[(size_t) ch];
-            float x = osBlock.getChannelPointer((size_t) ch)[i] * gainNow;
-            if (! std::isfinite(x)) x = 0.0f;
-            cs.delay[(size_t) (writePos % delayCapacity)] = x;
+            float xRaw = osBlock.getChannelPointer((size_t) ch)[i];
+            if (! std::isfinite(xRaw)) xRaw = 0.0f;
+            cs.dryDelay[(size_t) (writePos % delayCapacity)] = xRaw; // untouched — Gain never applied here
 
-            const float instantAbs = std::abs(x);
+            // Gain is applied exactly once, right here, only for the wet (limited) path.
+            const float xGained = xRaw * gainNow;
+            cs.delay[(size_t) (writePos % delayCapacity)] = xGained;
+
+            const float instantAbs = std::abs(xGained);
             if ((writePos % factor) == 0) cs.heldDigitalPeak = instantAbs;
             peak[ch] = truePeakEnabled ? instantAbs : cs.heldDigitalPeak;
         }
@@ -208,17 +222,27 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
                 popExpiredMin(cs, readPos, minRingCapacity);
                 const float windowMin = cs.minCount > 0 ? cs.minValRing[(size_t) cs.minHead] : 1.0f;
 
-                if (windowMin < cs.currentGain)
+                if (bypassed)
+                {
+                    // No stale gain reduction or ramping left over for when Bypass
+                    // comes back off — the gain computer sits at rest, ready to go.
+                    cs.currentGain = 1.0f;
+                }
+                else if (windowMin < cs.currentGain)
                     cs.currentGain = windowMin; // instant foresight-based attack (already ramped by the window)
                 else
                     cs.currentGain = windowMin + computeReleaseCoeff(windowMin, osSampleRate) * (cs.currentGain - windowMin);
 
-                float y = cs.delay[(size_t) (readPos % delayCapacity)] * cs.currentGain;
-                applyCharacter(y);
-                y = juce::jlimit(-ceilNow, ceilNow, y); // last-resort safety net, not the primary mechanism
+                float wet = cs.delay[(size_t) (readPos % delayCapacity)] * cs.currentGain;
+                applyCharacter(wet);
+                wet = juce::jlimit(-ceilNow, ceilNow, wet); // last-resort safety net, not the primary mechanism
+                const float dry = cs.dryDelay[(size_t) (readPos % delayCapacity)];
+
+                const float y = wet + mixToDry * (dry - wet);
                 osBlock.getChannelPointer((size_t) ch)[i] = y;
 
-                minGainThisBlock = juce::jmin(minGainThisBlock, cs.currentGain);
+                const float effectiveGain = cs.currentGain + mixToDry * (1.0f - cs.currentGain);
+                minGainThisBlock = juce::jmin(minGainThisBlock, effectiveGain);
                 maxAbsOutThisBlock = juce::jmax(maxAbsOutThisBlock, std::abs(y));
             }
             ++readPos;
@@ -240,12 +264,17 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
     // the actual output samples is the true, unconditional ceiling guarantee — it is a
     // last-resort net, not the primary limiting mechanism, and is inaudible on program
     // material since it only ever trims filter ringing, not real gain reduction.
-    const float ceilingNow = ceilingSmoothed.getCurrentValue();
-    for (int ch = 0; ch < chans; ++ch)
+    // Bypassed is a true, unclamped pass-through, so this net is skipped while bypassed
+    // (it would otherwise clip dry material that legitimately exceeds the ceiling).
+    if (! bypassed)
     {
-        auto* d = buffer.getWritePointer(ch);
-        for (int i = 0; i < buffer.getNumSamples(); ++i)
-            d[i] = juce::jlimit(-ceilingNow, ceilingNow, d[i]);
+        const float ceilingNow = ceilingSmoothed.getCurrentValue();
+        for (int ch = 0; ch < chans; ++ch)
+        {
+            auto* d = buffer.getWritePointer(ch);
+            for (int i = 0; i < buffer.getNumSamples(); ++i)
+                d[i] = juce::jlimit(-ceilingNow, ceilingNow, d[i]);
+        }
     }
 
     currentGrDb.store(juce::Decibels::gainToDecibels(minGainThisBlock, -60.0f));

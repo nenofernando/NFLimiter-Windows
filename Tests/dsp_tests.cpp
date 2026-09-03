@@ -249,6 +249,159 @@ namespace
         }
         check(matches, "bypass reproduces the input exactly, delayed by the reported latency");
     }
+
+    // Reproduces the reported bug directly: with Bypass ON, sweeping Gain from 0 to
+    // +24dB must never change the output. The old code applied inputGain before
+    // checking bypass, so this would have failed before the fix.
+    void runBypassIgnoresGainCheck()
+    {
+        const double sr = 48000.0;
+        const int n = (int) sr;
+        const int latencyToSkip = 600; // generous margin over any factor's lookahead+filter latency
+
+        auto renderWithGain = [&](float gainDb)
+        {
+            LimiterEngine engine;
+            engine.prepare(sr, 512, 2);
+            engine.setParameters(gainDb, -1.0f, 150.0f, true, LimiterEngine::Character::clean, 100.0f, true, true);
+            auto signal = makeSine(2, n, sr, 1000.0, 0.25f); // -12 dBFS-ish sine
+            return runThroughInBlocks(engine, signal, { 512 });
+        };
+
+        auto out0 = renderWithGain(0.0f);
+        auto out24 = renderWithGain(24.0f);
+
+        float maxDiff = 0.0f;
+        for (int ch = 0; ch < 2; ++ch)
+            for (int i = latencyToSkip; i < n; ++i)
+                maxDiff = juce::jmax(maxDiff, std::abs(out0.getSample(ch, i) - out24.getSample(ch, i)));
+
+        char label[160];
+        std::snprintf(label, sizeof(label), "Bypass ON: output identical for Gain=0dB vs Gain=+24dB (max diff = %.8f)", (double) maxDiff);
+        check(maxDiff < 1.0e-6f, label);
+    }
+
+    // Null test: bypassed output minus the (latency-aligned) input should be near
+    // digital silence, for a variety of gain settings. The residual isn't exactly zero:
+    // per the fix's requirement that the dry path receive *exactly* the wet path's
+    // latency, bypassed audio still round-trips through the same oversampling up/down
+    // filter pair (that's what keeps the latency identical and click-free when toggling
+    // mid-stream) — a well-designed half-band filter's own passband ripple/insertion
+    // loss on that round trip, independent of gain, is the entire residual. Threshold
+    // is set at -40dB relative to signal amplitude, comfortably above that filter
+    // ripple floor and comfortably below anything an actual logic bug would produce.
+    void runBypassNullTest()
+    {
+        const double sr = 48000.0;
+        const int n = (int) sr;
+        const float amplitude = 0.35f;
+        const float thresholdDb = -40.0f;
+        const float threshold = amplitude * juce::Decibels::decibelsToGain(thresholdDb);
+
+        for (float gainDb : { 0.0f, 6.0f, 24.0f, -6.0f })
+        {
+            LimiterEngine engine;
+            engine.prepare(sr, 512, 2);
+            engine.setParameters(gainDb, -1.0f, 150.0f, true, LimiterEngine::Character::loud, 100.0f, true, true);
+            auto signal = makeSine(2, n, sr, 440.0, amplitude);
+            auto out = runThroughInBlocks(engine, signal, { 512 });
+            const int latency = engine.latencySamples();
+
+            float maxAbsDiff = 0.0f;
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < n - latency - 8; ++i)
+                    maxAbsDiff = juce::jmax(maxAbsDiff, std::abs(out.getSample(ch, i + latency) - signal.getSample(ch, i)));
+
+            const float diffDb = juce::Decibels::gainToDecibels(maxAbsDiff / amplitude);
+            char label[192];
+            std::snprintf(label, sizeof(label), "null test @ gain=%.0fdB: max|out-in| = %.8f (%.1f dB rel., oversampling round-trip ripple only)",
+                          (double) gainDb, (double) maxAbsDiff, (double) diffDb);
+            check(maxAbsDiff < threshold, label);
+        }
+    }
+
+    // Bypass OFF: Gain must be applied exactly once (not doubled). A sine well under
+    // the ceiling at Gain=+6dB should come out ~6dB hotter, not ~12dB.
+    void runGainAppliedOnceCheck()
+    {
+        const double sr = 48000.0;
+        const int n = (int) sr;
+        LimiterEngine engine;
+        engine.prepare(sr, 512, 2);
+        engine.setParameters(6.0f, -1.0f, 150.0f, true, LimiterEngine::Character::clean, 100.0f, true, false);
+        auto signal = makeSine(2, n, sr, 1000.0, 0.1f); // well under ceiling even after +6dB
+        auto out = runThroughInBlocks(engine, signal, { 512 });
+
+        const float inPeak = maxAbs(signal);
+        const float outPeak = maxAbs(out);
+        const float measuredGainDb = juce::Decibels::gainToDecibels(outPeak / inPeak);
+
+        char label[160];
+        std::snprintf(label, sizeof(label), "Gain=+6dB applied exactly once: measured gain = %.2f dB (expected ~6.0, not ~12.0)", (double) measuredGainDb);
+        check(std::abs(measuredGainDb - 6.0f) < 0.5f, label);
+    }
+
+    // Toggling Bypass on/off mid-playback must not click or leave stale gain-reduction
+    // state — checked as a bound on the largest sample-to-sample second derivative
+    // right around the toggle instants.
+    void runBypassToggleClickCheck()
+    {
+        const double sr = 48000.0;
+        const int n = (int) sr * 2;
+        LimiterEngine engine;
+        engine.prepare(sr, 256, 2);
+        engine.setParameters(12.0f, -3.0f, 150.0f, true, LimiterEngine::Character::loud, 100.0f, true, false);
+        auto signal = makeSine(2, n, sr, 300.0, 0.9f); // hot enough to be actively limited
+        juce::AudioBuffer<float> out(signal);
+
+        int pos = 0;
+        const int step = 256;
+        int block = 0;
+        while (pos < n)
+        {
+            const bool bypassNow = (block / 4) % 2 == 1; // flip every 4 blocks
+            engine.setParameters(12.0f, -3.0f, 150.0f, true, LimiterEngine::Character::loud, 100.0f, true, bypassNow);
+            const int bs = juce::jmin(step, n - pos);
+            juce::AudioBuffer<float> chunk(out.getArrayOfWritePointers(), 2, pos, bs);
+            engine.process(chunk);
+            pos += bs;
+            ++block;
+        }
+
+        float maxSecondDeriv = 0.0f;
+        for (int ch = 0; ch < 2; ++ch)
+        {
+            auto* d = out.getReadPointer(ch);
+            for (int i = 2; i < n; ++i)
+                maxSecondDeriv = juce::jmax(maxSecondDeriv, std::abs(d[i] - 2.0f * d[i - 1] + d[i - 2]));
+        }
+        char label[160];
+        std::snprintf(label, sizeof(label), "Bypass toggled every 4 blocks while limiting: max |2nd derivative| = %.4f", (double) maxSecondDeriv);
+        check(maxSecondDeriv < 0.6f, label);
+        check(! hasNonFinite(out), "bypass-toggle stress buffer stays finite");
+    }
+
+    // With Bypass ON, gain reduction reported to the UI must read 0.0 dB.
+    void runBypassReportsZeroGrCheck()
+    {
+        const double sr = 48000.0;
+        LimiterEngine engine;
+        engine.prepare(sr, 512, 2);
+        engine.setParameters(18.0f, -6.0f, 150.0f, true, LimiterEngine::Character::loud, 100.0f, true, true);
+        auto signal = makeSine(2, (int) sr, sr, 500.0, 0.95f); // would be heavily limited if not bypassed
+        auto buf = signal;
+        int pos = 0;
+        while (pos < buf.getNumSamples())
+        {
+            const int bs = juce::jmin(512, buf.getNumSamples() - pos);
+            juce::AudioBuffer<float> chunk(buf.getArrayOfWritePointers(), 2, pos, bs);
+            engine.process(chunk);
+            pos += bs;
+        }
+        char label[128];
+        std::snprintf(label, sizeof(label), "Bypass ON reports 0.0dB gain reduction (got %.3f dB)", (double) engine.gainReductionDb());
+        check(std::abs(engine.gainReductionDb()) < 0.05f, label);
+    }
 }
 
 int main()
@@ -266,6 +419,21 @@ int main()
 
     std::printf("\n-- Bypass latency-compensation check --\n");
     runBypassLatencyCheck();
+
+    std::printf("\n-- Bypass ignores Gain (0 vs +24dB must be identical) --\n");
+    runBypassIgnoresGainCheck();
+
+    std::printf("\n-- Bypass null test (output == input, latency-aligned) --\n");
+    runBypassNullTest();
+
+    std::printf("\n-- Gain applied exactly once (not doubled) --\n");
+    runGainAppliedOnceCheck();
+
+    std::printf("\n-- Bypass toggle click check --\n");
+    runBypassToggleClickCheck();
+
+    std::printf("\n-- Bypass reports 0.0dB gain reduction --\n");
+    runBypassReportsZeroGrCheck();
 
     std::printf("\n== %d failure(s), %d warning(s) ==\n", failures, warnings);
     return failures == 0 ? 0 : 1;
