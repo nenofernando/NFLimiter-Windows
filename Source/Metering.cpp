@@ -88,13 +88,15 @@ void Metering::captureOutput(const juce::AudioBuffer<float>& b, float grDb, floa
     gr = grDb;
     truePeak = truePeakDbIn;
 
-    // CLIP is an overload-vs-ceiling indicator (never a clipper control): it lights
-    // when the post-limiter, post-oversampling, post-ceiling true peak exceeds the
-    // *current* ceiling by more than a hair (filter-ringing headroom), holds briefly
-    // so a fast transient is actually seen, then clears on its own. Bypass always wins:
-    // no leftover latch can glow through it.
-    static constexpr float kClipMarginDb = 0.05f;
-    static constexpr double kClipHoldSeconds = 1.0;
+    // TRUE PEAK OVER is an overload-vs-ceiling indicator (never a clipper control): it
+    // lights when the SAME dedicated-detector reading shown on the True Peak card
+    // (truePeakDbIn, measured on the final post-limiter/post-ceiling/post-downsampling
+    // output — see LimiterEngine::truePeakDb()) exceeds the *current* ceiling by more
+    // than a hair, holds so a fast transient is actually seen, then clears on its own.
+    // A new over during an active hold re-triggers the full hold (jmax below). Bypass
+    // always wins: no leftover latch can glow through it.
+    static constexpr float kClipMarginDb = 0.02f;
+    static constexpr double kClipHoldSeconds = 1.5;
     if (bypassed)
     {
         clipHoldSamplesRemaining = 0;
