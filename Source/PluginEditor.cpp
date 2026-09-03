@@ -431,7 +431,21 @@ void NFLimiterAudioProcessorEditor::drawGainReductionPanel(juce::Graphics& g)
 {
     using namespace NFLayout;
     drawPanel(g, grPanel);
-    drawTitle(g, grTitle, "GAIN REDUCTION", 17.0f);
+
+    // Every element below shares the panel's true horizontal centre — the scale
+    // column sits outside this to the left and never enters the centring maths.
+    const float centerX = grPanel.getCentreX();
+    auto meterBounds = grBar;
+    meterBounds.setX(centerX - meterBounds.getWidth() * 0.5f);
+    auto numberBounds = grNumber;
+    numberBounds.setX(meterBounds.getX());
+    numberBounds.setWidth(meterBounds.getWidth());
+    auto historyBounds = grHistory;
+    historyBounds.setX(centerX - historyBounds.getWidth() * 0.5f);
+    auto titleBounds = grTitle;
+    titleBounds.setX(centerX - titleBounds.getWidth() * 0.5f);
+
+    drawTitle(g, titleBounds, "GAIN REDUCTION", 17.0f);
 
     const int steps[] { 0, -4, -8, -12, -16, -20, -24 };
     g.setFont(juce::Font(juce::FontOptions(13.0f)));
@@ -451,18 +465,18 @@ void NFLimiterAudioProcessorEditor::drawGainReductionPanel(juce::Graphics& g)
     // when unlit), and segments light up top-down in the fixed yellow/orange/red band
     // as gain reduction increases — never a plain empty box, never a permanent glow.
     g.setColour(NFColour::wellBg);
-    g.fillRect(grBar);
+    g.fillRect(meterBounds);
 
     const float amount = juce::jlimit(0.0f, 24.0f, -snapshot.gainReduction);
     const int numSegments = 48;
     const float segGap = 1.5f;
-    const float segH = (grBar.getHeight() - segGap * (float) (numSegments - 1)) / (float) numSegments;
+    const float segH = (meterBounds.getHeight() - segGap * (float) (numSegments - 1)) / (float) numSegments;
     const int litCount = juce::roundToInt(juce::jmap(amount, 0.0f, 24.0f, 0.0f, (float) numSegments));
 
     for (int i = 0; i < numSegments; ++i)
     {
-        const float segY = grBar.getY() + (float) i * (segH + segGap);
-        juce::Rectangle<float> seg(grBar.getX(), segY, grBar.getWidth(), segH);
+        const float segY = meterBounds.getY() + (float) i * (segH + segGap);
+        juce::Rectangle<float> seg(meterBounds.getX(), segY, meterBounds.getWidth(), segH);
         if (i < litCount)
         {
             const float t = (float) i / (float) (numSegments - 1);
@@ -475,13 +489,20 @@ void NFLimiterAudioProcessorEditor::drawGainReductionPanel(juce::Graphics& g)
         g.fillRect(seg);
     }
     g.setColour(NFColour::wellBorder);
-    g.drawRect(grBar, 1.0f);
+    g.drawRect(meterBounds, 1.0f);
 
     g.setFont(juce::Font(juce::FontOptions(42.0f, juce::Font::bold)));
     g.setColour(juce::Colour(0xffff5a3c));
-    g.drawText(juce::String(snapshot.gainReduction, 1) + " dB", grNumber, juce::Justification::centred);
+    g.drawText(juce::String(snapshot.gainReduction, 1) + " dB",
+               (int) numberBounds.getX(), (int) numberBounds.getY(), (int) numberBounds.getWidth(), (int) numberBounds.getHeight(),
+               juce::Justification::centred);
 
-    drawHistoryPanel(g, grHistory);
+    drawHistoryPanel(g, historyBounds);
+
+   #if NF_DEBUG_GR_CENTER_GUIDES
+    g.setColour(juce::Colours::red);
+    g.drawLine(centerX, grPanel.getY(), centerX, grPanel.getBottom(), 1.0f);
+   #endif
 }
 
 void NFLimiterAudioProcessorEditor::drawHistoryPanel(juce::Graphics& g, juce::Rectangle<float> area)
@@ -638,14 +659,23 @@ void NFLimiterAudioProcessorEditor::paint(juce::Graphics& g)
     logoBounds = map(logoText);
 
     {
-        auto nameR = juce::Rectangle<float>(titleText.getX(), titleText.getY(), titleText.getWidth(), titleText.getHeight() * 0.56f);
+        // "NF Limiter" and its subtitle share the GAIN REDUCTION panel's centreX
+        // (not the full window's), so the whole vertical stack lines up.
+        const float titleCenterX = grPanel.getCentreX();
+        auto nameR = juce::Rectangle<float>(titleCenterX - titleText.getWidth() * 0.5f, titleText.getY(),
+                                             titleText.getWidth(), titleText.getHeight() * 0.56f);
         g.setGradientFill(juce::ColourGradient(juce::Colour(0xfff5f6f8), nameR.getX(), nameR.getY(),
                                                 juce::Colour(0xff9aa0aa), nameR.getX(), nameR.getBottom(), false));
         g.setFont(juce::Font(juce::FontOptions(42.0f, juce::Font::bold)));
         g.drawText("NF Limiter", nameR, juce::Justification::centred);
         g.setColour(NFColour::textDim);
         g.setFont(juce::Font(juce::FontOptions(15.0f)).withExtraKerningFactor(0.24f));
-        g.drawText("TRUE PEAK MASTERING LIMITER", juce::Rectangle<float>(titleText.getX(), nameR.getBottom() + 2.0f, titleText.getWidth(), 24.0f), juce::Justification::centred);
+        g.drawText("TRUE PEAK MASTERING LIMITER", nameR.withY(nameR.getBottom() + 2.0f).withHeight(24.0f), juce::Justification::centred);
+
+       #if NF_DEBUG_GR_CENTER_GUIDES
+        g.setColour(juce::Colours::red);
+        g.drawLine(titleCenterX, 4.0f, titleCenterX, (float) (NFLayout::grPanel.getBottom()), 1.0f);
+       #endif
     }
 
     drawPill(g, presetPill);
