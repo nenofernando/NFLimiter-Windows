@@ -80,7 +80,9 @@ private:
     MeterSnapshot snapshot;
     juce::Rectangle<int> logoBounds;
 
-    static constexpr int defaultW = 1280, defaultH = 820;
+    // Exactly the 1536:1024 (1.5) design aspect ratio, just a bit smaller than before
+    // so the plugin doesn't dominate the screen on first open.
+    static constexpr int defaultW = 1080, defaultH = 720;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(NFLimiterAudioProcessorEditor)
 };
