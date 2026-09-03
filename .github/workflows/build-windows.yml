@@ -1,0 +1,146 @@
+name: Build Windows VST3 and Installer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Windows x64 Release
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    env:
+      BUILD_DIR: build-vst3-windows-x64
+      LOG_DIR: build-logs
+      VST3_PATH: build-vst3-windows-x64/NFLimiter_artefacts/Release/VST3/NF Limiter.vst3
+      INSTALLER_PATH: dist/NF-Limiter-Windows-x64-Setup.exe
+
+    steps:
+      - name: Checkout NF Limiter
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout JUCE 9.0.1
+        uses: actions/checkout@v4
+        with:
+          repository: juce-framework/JUCE
+          ref: 9.0.1
+          path: JUCE
+          persist-credentials: false
+
+      - name: Record toolchain versions
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          cmake --version | Tee-Object "$env:LOG_DIR/cmake-version.log"
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+            -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationVersion |
+            Tee-Object "$env:LOG_DIR/visual-studio-version.log"
+
+      - name: Configure Windows x64
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cmake --preset vst3-windows-x64 2>&1 |
+            Tee-Object "$env:LOG_DIR/cmake-configure.log"
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake configure failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Build VST3 and test executables
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cmake --build --preset build-vst3-windows-x64 --parallel 2>&1 |
+            Tee-Object "$env:LOG_DIR/cmake-build.log"
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake build failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Verify VST3 artefact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not (Test-Path $env:VST3_PATH)) {
+            throw "VST3 bundle not found: $env:VST3_PATH"
+          }
+          Get-ChildItem -Recurse $env:VST3_PATH |
+            Select-Object FullName, Length |
+            Format-Table -AutoSize |
+            Out-String -Width 240 |
+            Set-Content "$env:LOG_DIR/vst3-files.log"
+
+      - name: Run DSP and state/preset tests
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dsp = Join-Path $env:BUILD_DIR "Release/NFLimiterDspTests.exe"
+          $state = Join-Path $env:BUILD_DIR "Release/NFLimiterStateTests.exe"
+          foreach ($test in @($dsp, $state)) {
+            if (-not (Test-Path $test)) {
+              Write-Warning "Test executable not found: $test"
+              continue
+            }
+            & $test 2>&1 | Tee-Object -Append "$env:LOG_DIR/tests.log"
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "$test failed with exit code $LASTEXITCODE (installer will still be built)"
+            }
+          }
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          choco install innosetup -y --no-progress 2>&1 |
+            Tee-Object "$env:LOG_DIR/inno-setup-install.log"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup installation failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          & .\build-installer-windows.ps1 -SkipBuild -SkipTests 2>&1 |
+            Tee-Object "$env:LOG_DIR/installer-build.log"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installer build failed with exit code $LASTEXITCODE"
+          }
+          if (-not (Test-Path $env:INSTALLER_PATH)) {
+            throw "Installer not found: $env:INSTALLER_PATH"
+          }
+          Get-FileHash -Algorithm SHA256 $env:INSTALLER_PATH |
+            Format-List |
+            Out-String |
+            Set-Content "$env:LOG_DIR/installer-sha256.log"
+
+      - name: Upload VST3 Windows x64
+        uses: actions/upload-artifact@v4
+        with:
+          name: VST3 Windows x64
+          path: ${{ env.VST3_PATH }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: NF Limiter Windows x64 Installer
+          path: ${{ env.INSTALLER_PATH }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Windows build logs
+          path: ${{ env.LOG_DIR }}
+          if-no-files-found: warn
+          retention-days: 14

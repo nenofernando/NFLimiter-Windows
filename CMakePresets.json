@@ -1,0 +1,25 @@
+{
+  "version": 4,
+  "cmakeMinimumRequired": { "major": 3, "minor": 22, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "vst3-windows-x64",
+      "displayName": "VST3 Windows x64 - Visual Studio 2022",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build-vst3-windows-x64",
+      "cacheVariables": {
+        "NF_BUILD_AAX": "OFF",
+        "NF_BUILD_TESTS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "build-vst3-windows-x64",
+      "configurePreset": "vst3-windows-x64",
+      "configuration": "Release",
+      "targets": [ "NFLimiter_VST3", "NFLimiterDspTests", "NFLimiterStateTests" ]
+    }
+  ]
+}
