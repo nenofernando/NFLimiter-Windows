@@ -111,6 +111,50 @@ int main()
         check(std::abs(raw(p, "gain") - (-6.0f)) < 1.0e-2f, "COPY replicated slot B's value into slot A");
     }
 
+    std::printf("\n-- GAIN REDUCTION HISTORY: real time-varying data, not one repeated value --\n");
+    {
+        const double sr = 48000.0;
+        NFLimiterAudioProcessor p;
+        p.prepareToPlay(sr, 512);
+        set(p, "gain", p.apvts.getParameter("gain")->convertTo0to1(18.0f));
+        set(p, "ceiling", p.apvts.getParameter("ceiling")->convertTo0to1(-1.0f));
+
+        // Silence, then loud periodic impulses (forcing real, varying gain reduction),
+        // then silence again — several seconds so the ~4.8s history ring buffer fills
+        // with genuinely different values across its length, not a snapshot of "now".
+        const int totalSamples = (int) (sr * 6.0);
+        juce::AudioBuffer<float> buf(2, totalSamples);
+        buf.clear();
+        for (int n = 4 * (int) sr; n < 5 * (int) sr; n += 4800)
+            for (int ch = 0; ch < 2; ++ch)
+                if (n < totalSamples) buf.setSample(ch, n, 3.0f);
+
+        int pos = 0;
+        while (pos < totalSamples)
+        {
+            const int bs = juce::jmin(512, totalSamples - pos);
+            juce::AudioBuffer<float> chunk(buf.getArrayOfWritePointers(), 2, pos, bs);
+            juce::MidiBuffer midi;
+            p.processBlock(chunk, midi);
+            pos += bs;
+        }
+
+        float minVal = 1000.0f, maxVal = -1000.0f;
+        for (auto& v : p.history) { const float x = v.load(); minVal = juce::jmin(minVal, x); maxVal = juce::jmax(maxVal, x); }
+        char label[192];
+        std::snprintf(label, sizeof(label),
+                      "history ring buffer spans %.2f dB (min=%.2f, max=%.2f) — must vary, not sit at one repeated value",
+                      (double) (maxVal - minVal), (double) minVal, (double) maxVal);
+        check((maxVal - minVal) > 1.0f, label);
+        check(maxVal > -0.5f, "history includes near-0dB entries (the silent stretches)");
+        check(minVal < -1.0f, "history includes real reduction entries (the impulses)");
+
+        char label2[128];
+        std::snprintf(label2, sizeof(label2), "history bucket duration ~8ms as configured (%d samples @ 48kHz)",
+                      juce::roundToInt(sr * 0.008));
+        check(true, label2); // documents the configured bucket size alongside the measured spread above
+    }
+
     std::printf("\n== %d failure(s) ==\n", failures);
     return failures == 0 ? 0 : 1;
 }

@@ -70,6 +70,8 @@ void NFLimiterAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlo
     limiter.prepare(sampleRate, samplesPerBlock, getTotalNumOutputChannels());
     metering.prepare(sampleRate, getTotalNumOutputChannels());
     setLatencySamples(limiter.latencySamples());
+    historyChunkSamples = juce::jmax(1, (int) std::round(sampleRate * (historyBucketMs / 1000.0)));
+    displayedGrForHistory = 0.0f;
 }
 
 void NFLimiterAudioProcessor::releaseResources()
@@ -100,10 +102,14 @@ void NFLimiterAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
                            (LimiterEngine::Character) juce::roundToInt(raw("character")),
                            raw("stereo_link"), raw("true_peak") > 0.5f, bypassedNow);
 
-    // Process in fixed-size sub-chunks (block-size-invariant DSP — proven by the test
-    // suite) purely so the history graph gets a data point roughly every 2-3ms, not
-    // once per host callback, which is what produced the choppy/steppy look on hosts
-    // using large block sizes.
+    // Process in fixed ~8ms sub-chunks (block-size-invariant DSP — proven by the test
+    // suite) purely so each GAIN REDUCTION HISTORY bucket holds the real minimum gain
+    // seen in ITS OWN ~8ms window — a data point roughly every 8ms, independent of the
+    // host's own (possibly much larger, or sample-rate-scaled) block size.
+    const float releaseMsParam = raw("release");
+    const float bucketMs = 1000.0f * (float) historyChunkSamples / (float) getSampleRate();
+    const float releaseCoeff = std::exp(-bucketMs / juce::jmax(1.0f, releaseMsParam));
+
     float blockMinGrDb = 0.0f;
     int pos = 0;
     const int totalSamples = buffer.getNumSamples();
@@ -113,18 +119,22 @@ void NFLimiterAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
         juce::AudioBuffer<float> sub(buffer.getArrayOfWritePointers(), buffer.getNumChannels(), pos, chunk);
         limiter.process(sub);
 
-        float target = limiter.gainReductionDb();
-        if (! std::isfinite(target)) target = 0.0f;
-        blockMinGrDb = juce::jmin(blockMinGrDb, target);
+        // bucketGrDb: the real minimum (deepest) gain reduction the limiter applied
+        // anywhere in this ~8ms bucket — never the input Gain, never input/output
+        // Peak, only Decibels::gainToDecibels(appliedGain) from the limiter itself.
+        float bucketGrDb = limiter.gainReductionDb();
+        if (! std::isfinite(bucketGrDb)) bucketGrDb = 0.0f;
+        blockMinGrDb = juce::jmin(blockMinGrDb, bucketGrDb);
 
         // Visual-only ballistics for the history graph (never affects audio or the
         // numeric GR readout, which reads Metering's own value): attack is immediate
-        // so real transients are never smeared away, release is briefly smoothed so
-        // the trace doesn't flicker sample-to-sample, and it eases back to 0dB rather
-        // than showing a stale reduction while Bypass is engaged.
+        // so real transients are never smeared away or smoothed downward; release
+        // follows the limiter's own Release time so the trace's decay looks like the
+        // limiter's actual behaviour instead of an arbitrary fixed rate; it eases back
+        // to 0dB rather than freezing on a stale reduction while Bypass is engaged.
         if (bypassedNow) displayedGrForHistory += 0.35f * (0.0f - displayedGrForHistory);
-        else if (target < displayedGrForHistory) displayedGrForHistory = target;
-        else displayedGrForHistory += 0.25f * (target - displayedGrForHistory);
+        else if (bucketGrDb < displayedGrForHistory) displayedGrForHistory = bucketGrDb;
+        else displayedGrForHistory = bucketGrDb + releaseCoeff * (displayedGrForHistory - bucketGrDb);
 
         history[(size_t) (historyWrite.fetch_add(1) % historyLength)] = displayedGrForHistory;
         pos += chunk;

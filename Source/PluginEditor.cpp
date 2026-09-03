@@ -567,16 +567,33 @@ void NFLimiterAudioProcessorEditor::drawHistoryPanel(juce::Graphics& g, juce::Re
     fill.lineTo(plot.getRight(), plot.getY());
     fill.closeSubPath();
 
-    juce::ColourGradient fireGradient(juce::Colour(0xffff9a00), 0, plot.getY(),
-                                       juce::Colour(0xffff2418), 0, plot.getBottom(), false);
-    fireGradient.addColour(0.5, juce::Colour(0xffff5a00));
-    g.setGradientFill(fireGradient);
+    // Colour bands by depth (0dB at the top down to -24dB at the bottom), so red only
+    // ever shows up where the curve actually dips deep, not across the whole graph:
+    // 0..-6dB orange, -6..-12dB a stronger orange, -12..-24dB red. Stops are doubled up
+    // just before each boundary so the transition is a near-hard band, not a smooth
+    // blend across the full 24dB range.
+    const juce::Colour bandOrange (0xffff9500), bandStrongOrange (0xffff6500), bandRed (0xffff3028);
+    auto bandedGradient = [&](float topAlpha, float bottomAlpha)
+    {
+        juce::ColourGradient gr(bandOrange.withAlpha(topAlpha), 0, plot.getY(),
+                                 bandRed.withAlpha(bottomAlpha), 0, plot.getBottom(), false);
+        const float midAlpha = (topAlpha + bottomAlpha) * 0.5f;
+        gr.addColour(0.2499, bandOrange.withAlpha(topAlpha));
+        gr.addColour(0.25, bandStrongOrange.withAlpha(midAlpha));
+        gr.addColour(0.4999, bandStrongOrange.withAlpha(midAlpha));
+        gr.addColour(0.5, bandRed.withAlpha(bottomAlpha));
+        return gr;
+    };
+
+    // Fill: low alpha throughout (0.18 near the 0dB line, fading to 0.06 near the
+    // bottom/curve) — a discreet tint, never a solid opaque block.
+    g.setGradientFill(bandedGradient(0.18f, 0.06f));
     g.fillPath(fill);
 
-    // Discreet glow behind the line, then a crisp orange stroke on top.
-    g.setColour(juce::Colour(0xffff9a00).withAlpha(0.35f));
+    // Discreet glow behind the line, then a crisp, depth-coloured stroke on top.
+    g.setGradientFill(bandedGradient(0.35f, 0.35f));
     g.strokePath(curve, juce::PathStrokeType(4.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-    g.setColour(juce::Colour(0xffffaa2e));
+    g.setGradientFill(bandedGradient(1.0f, 1.0f));
     g.strokePath(curve, juce::PathStrokeType(1.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
 }
 

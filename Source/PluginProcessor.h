@@ -39,7 +39,12 @@ public:
     juce::AudioProcessorValueTreeState apvts;
     PresetManager presets;
     Metering metering;
-    static constexpr int historyLength = 256;
+    // 600 buckets at ~8ms each ≈ 4.8s of real GAIN REDUCTION history (not a spectrum
+    // analyser — this is gain reduction over time). Bucket duration is fixed in
+    // *milliseconds*, converted to samples from the actual sample rate in
+    // prepareToPlay(), so the represented time span stays ~5s regardless of whether
+    // the host runs at 44.1kHz or 192kHz.
+    static constexpr int historyLength = 600;
     std::array<std::atomic<float>, historyLength> history {};
     std::atomic<int> historyWrite { 0 };
 
@@ -47,12 +52,8 @@ private:
     void parameterChanged(const juce::String& parameterID, float newValue) override;
     void handleAsyncUpdate() override;
 
-    // The history graph's time resolution must not depend on the host's arbitrary
-    // block size (a host using large blocks would otherwise produce a choppy graph
-    // with long flat segments) — processBlock slices the buffer into fixed small
-    // chunks and calls the engine once per chunk, so a history point is pushed every
-    // ~2-3ms of audio regardless of the host's own block size.
-    static constexpr int historyChunkSamples = 128;
+    static constexpr double historyBucketMs = 8.0;
+    int historyChunkSamples = 128; // recomputed from the real sample rate in prepareToPlay
     float displayedGrForHistory = 0.0f; // audio-thread-only: short visual-only smoothing
 
     LimiterEngine limiter;
