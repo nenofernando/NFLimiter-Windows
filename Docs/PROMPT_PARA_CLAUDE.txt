@@ -1,0 +1,52 @@
+Você recebeu o pack oficial NF Limiter V1.0. Antes de editar, leia README.md, os dois manuais, todos os fontes e Assets/ASSET_MANIFEST.md. A imagem Assets/Reference/NF_Limiter_approved_concept.png é a referência visual aprovada.
+
+OBJETIVO
+Finalizar do zero um limiter/mastering plugin simples, poderoso e comercial: “NF Limiter”, subtítulo “TRUE PEAK MASTERING LIMITER”, fabricante “NF Audio Tools”, crédito exato “NF AUDIO TOOLS — BY NENNO FERNANDO”. Nenno possui dois N.
+
+PRESERVE
+- IDs dos parâmetros e defaults existentes.
+- Gain, Ceiling, Release/Auto, Clean/Punch/Loud, True Peak, 1x/2x/4x/8x, Stereo Link e Bypass.
+- Preset bar, SAVE, menu de três traços, manuais, resize e clique no logo NF para 1280×820.
+- Visual do PNG de referência e assets separados.
+
+OBRIGAÇÕES DSP
+1. Substitua o detector aproximado por true-peak oversampled conforme ITU-R BS.1770/EBU aplicável; valide intersample peaks.
+2. Faça lookahead real, envelope estéreo estável e ceiling garantido sem hard clip como mecanismo principal.
+3. Implemente os três Characters com diferenças musicais documentadas, sem saltos de volume.
+4. Oversampling precisa processar o caminho necessário e ser reconfigurado fora da audio thread; atualize a latência da DAW.
+5. Nenhuma alocação, lock, arquivo, popup ou reconstrução de DSP dentro de processBlock.
+6. Smoothing click-free para todos os parâmetros automatizáveis.
+7. LUFS-M/LUFS-I segundo BS.1770, com K-weighting, gating e reset explícito. Não rotule aproximação como LUFS final.
+8. Bypass compensado por latência e sem clicks.
+9. Trate mono/stereo, denormals, NaN/Inf e sample rates 44.1–192 kHz.
+
+PRESETS
+- Factory: Default, Clean Master, Punch Bus e Loud Demo.
+- SAVE solicita nome, sanitiza e grava .nflpreset.
+- Permitir carregar, sobrescrever com confirmação e excluir somente presets do usuário.
+- Incluir versionamento/migração de estado e nunca quebrar IDs já lançados.
+- A/B deve guardar dois snapshots independentes; COPY copia do slot atual ao outro.
+
+INTERFACE
+- Meters Input ciano/verde, Output roxo/rosa, GR amarelo/laranja/vermelho.
+- Histórico de GR fluido, Peak, True Peak, LUFS-M, LUFS-I e CLIP.
+- Arrastar alça inferior direita redimensiona com aspecto e limites seguros.
+- Clique no logo NF restaura exatamente 1280×820.
+- Menu ☰: Manual Português, Manual English, Open Preset Folder, Reset Window Size, About.
+- Embuta os manuais no bundle/Resources para AU/VST3/AAX, resolvendo caminhos corretamente em cada host.
+- Faça acessibilidade, tooltips, teclado, Retina/HiDPI e escalas 100–200%.
+
+FORMATOS
+macOS: AU, VST3, Standalone e AAX com SDK. Windows: VST3, Standalone e AAX com SDK. Universal Binary macOS quando aplicável. Assinatura/notarização/instaladores somente após testes.
+
+TESTES OBRIGATÓRIOS
+- Pluginval em strictness alta.
+- Mono/stereo; 44.1, 48, 88.2, 96, 176.4, 192 kHz; blocos 1–8192.
+- Ceiling/true peak com sinais senoidais, impulses, sweeps, ruído, música e picos intersample.
+- Automação extrema sem clicks; bypass; offline bounce; save/recall; A/B/Copy; presets; resize; logo reset; manuais.
+- Reaper VST3, LUNA AU, Pro Tools AAX.
+- Relatório objetivo: passou/falhou/não testado. Nunca invente aprovação.
+
+ENTREGA
+Entregue código completo, testes, builds por formato, hashes e instaladores. Não altere o conceito nem acrescente compressor multibanda, threshold, ratio, attack ou knee à interface simples.
+

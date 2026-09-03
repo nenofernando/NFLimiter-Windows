@@ -1,0 +1,86 @@
+#pragma once
+#include <JuceHeader.h>
+#include "PluginProcessor.h"
+#include "Theme.h"
+
+// The whole UI is authored in a fixed 1536x1024 design space — the exact pixel size of
+// Assets/Reference/NF_Limiter_approved_concept.png and of Assets/Exact_PNG/LAYOUT_MAP.json
+// — and a single uniform scale+letterbox transform maps it onto the actual (resizable)
+// component bounds. Every rect below was measured directly from that reference image
+// (either taken verbatim from LAYOUT_MAP.json, or pixel-detected for the meters/GR bar),
+// so geometry is exact rather than approximated; only genuinely static, never-changing
+// pieces (logo, title lockup, footer credit) are drawn from the literal approved pixels,
+// since everything else must reflect live plugin state.
+class NFLimiterAudioProcessorEditor final : public juce::AudioProcessorEditor, private juce::Timer
+{
+public:
+    explicit NFLimiterAudioProcessorEditor(NFLimiterAudioProcessor&);
+    ~NFLimiterAudioProcessorEditor() override;
+
+    void paint(juce::Graphics&) override;
+    void resized() override;
+    void mouseDown(const juce::MouseEvent&) override;
+
+private:
+    using SliderAttachment = juce::AudioProcessorValueTreeState::SliderAttachment;
+    using ButtonAttachment = juce::AudioProcessorValueTreeState::ButtonAttachment;
+
+    struct ChoiceButtonGroup
+    {
+        void bind(juce::AudioProcessorValueTreeState& state, const juce::String& paramID, std::vector<juce::TextButton*> btns);
+        void refresh();
+        juce::AudioProcessorValueTreeState* apvts = nullptr;
+        juce::String id;
+        std::vector<juce::TextButton*> buttons;
+    };
+
+    static constexpr int designW = 1536, designH = 1024;
+    juce::AffineTransform designToScreen() const;
+    juce::Rectangle<int> map(juce::Rectangle<float> designRect) const;
+
+    void timerCallback() override;
+    void refreshPresetList();
+    void stepPreset(int direction);
+    void requestSavePreset();
+    void showMainMenu();
+    void showManualDialog(const juce::String& title, const juce::String& text);
+
+    void drawPanel(juce::Graphics&, juce::Rectangle<float>);
+    void drawTitle(juce::Graphics&, juce::Rectangle<float>, const juce::String&, float fontSize = 15.0f);
+    void drawMeterPair(juce::Graphics&, juce::Rectangle<float> barL, juce::Rectangle<float> barR,
+                        float scaleX, bool scaleOnLeft, float dbL, float dbR,
+                        juce::Colour top, juce::Colour bottom);
+    void drawGainReductionPanel(juce::Graphics&);
+    void drawHistoryPanel(juce::Graphics&, juce::Rectangle<float>);
+    void drawInfoBox(juce::Graphics&, juce::Rectangle<float>, const juce::String& label,
+                      const juce::String& value, juce::Colour valueColour);
+    void drawGroupBox(juce::Graphics&, juce::Rectangle<float>);
+    void drawPill(juce::Graphics&, juce::Rectangle<float>);
+
+    NFLimiterAudioProcessor& processor;
+    NFLookAndFeel look;
+
+    juce::Slider gain, ceiling, release, link;
+    juce::ToggleButton autoRelease { "AUTO" }, truePeak { "ON" };
+    juce::TextButton bypass { "BYPASS" }, power { "" };
+    juce::TextButton characterButtons[3] { juce::TextButton("CLEAN"), juce::TextButton("PUNCH"), juce::TextButton("LOUD") };
+    juce::TextButton oversamplingButtons[4] { juce::TextButton("1x"), juce::TextButton("2x"), juce::TextButton("4x"), juce::TextButton("8x") };
+    ChoiceButtonGroup characterGroup, oversamplingGroup;
+
+    juce::ComboBox presets;
+    juce::TextButton presetPrev { "<" }, presetNext { ">" }, savePreset { "SAVE" }, menu,
+                     aButton { "A" }, bButton { "B" }, copyButton { "COPY" };
+
+    juce::ComponentBoundsConstrainer constrainer;
+    juce::ResizableCornerComponent resizer;
+
+    std::unique_ptr<SliderAttachment> gainA, ceilingA, releaseA, linkA;
+    std::unique_ptr<ButtonAttachment> autoA, tpA, bypassA;
+
+    MeterSnapshot snapshot;
+    juce::Rectangle<int> logoBounds;
+
+    static constexpr int defaultW = 1280, defaultH = 820;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(NFLimiterAudioProcessorEditor)
+};
