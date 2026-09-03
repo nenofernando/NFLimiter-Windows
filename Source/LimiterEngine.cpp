@@ -31,6 +31,12 @@ void LimiterEngine::prepare(double sampleRate, int maximumBlockSize, int newNumC
     delayCapacity = lookaheadOsSamples[kNumOsSlots - 1] + 64;
     minRingCapacity = delayCapacity;
 
+    dedicatedTpOversampler = std::make_unique<juce::dsp::Oversampling<float>>(
+        (size_t) numChannels, (size_t) kDedicatedTpStages,
+        juce::dsp::Oversampling<float>::filterHalfBandPolyphaseIIR, true, false);
+    dedicatedTpOversampler->initProcessing((size_t) juce::jmax(1, maximumBlockSize));
+    dedicatedTpScratch.setSize(numChannels, juce::jmax(1, maximumBlockSize), false, false, true);
+
     // Unlike the wet path's lookahead ring (where read trails write by a bounded
     // lookaheadOs at all times, interleaved sample-by-sample), the dry path writes an
     // entire block and then reads it back in a second pass — so the ring must hold at
@@ -81,6 +87,7 @@ void LimiterEngine::reset()
         cs.minHead = 0; cs.minCount = 0; cs.currentGain = 1.0f; cs.heldDigitalPeak = 0.0f;
     }
     for (auto& os : oversamplers) if (os) os->reset();
+    if (dedicatedTpOversampler) dedicatedTpOversampler->reset();
     currentGrDb.store(0.0f);
 }
 
@@ -211,7 +218,6 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
     const int lookaheadOs = lookaheadOsSamples[(size_t) idx];
     const double osSampleRate = baseSampleRate * (double) factor;
     float minGainThisBlock = 1.0f;
-    float maxAbsWetOS = 0.0f; // oversampled (genuine true-peak) reading of the wet signal
 
     for (int i = 0; i < osNumSamples; ++i)
     {
@@ -300,7 +306,6 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
                 osBlock.getChannelPointer((size_t) ch)[i] = wet;
 
                 minGainThisBlock = juce::jmin(minGainThisBlock, cs.currentGain);
-                maxAbsWetOS = juce::jmax(maxAbsWetOS, std::abs(wet));
             }
             ++readPos;
         }
@@ -340,7 +345,6 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
     // bit-exact pass-through, not an approximation. `buffer` holds the wet result now;
     // blend in the latency-aligned dry sample by however far bypassMix has ramped.
     const int totalLatency = latencySamplesFor(factor);
-    float maxAbsOutThisBlock = 0.0f;
     float finalMix = 0.0f;
     for (int n = 0; n < numBaseSamples; ++n)
     {
@@ -354,9 +358,7 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
             auto& cs = channelState[(size_t) ch];
             auto* d = buffer.getWritePointer(ch);
             const float dry = srcAbs >= 0 ? cs.dryBaseDelay[(size_t) (srcAbs % dryDelayCapacity)] : 0.0f;
-            const float y = d[n] + mix * (dry - d[n]);
-            d[n] = y;
-            maxAbsOutThisBlock = juce::jmax(maxAbsOutThisBlock, std::abs(y));
+            d[n] = d[n] + mix * (dry - d[n]);
         }
     }
     baseWritePos += numBaseSamples;
@@ -366,12 +368,27 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
     const float reportedGain = minGainThisBlock + finalMix * (1.0f - minGainThisBlock);
     currentGrDb.store(juce::Decibels::gainToDecibels(reportedGain, -60.0f));
 
-    // The True Peak meter (and the TRUE PEAK OVER indicator it feeds) always reports the
-    // genuine oversampled/intersample peak, regardless of the True Peak toggle — that
-    // toggle only decides whether this peak is allowed to *drive gain reduction*
-    // ("True Peak Limiting"), never whether it's *measured* ("True Peak Meter"). With it
-    // off, the reconstructed peak can legitimately exceed the ceiling, and OVER must
-    // still be able to light up to say so. Bypassed always reports the real output.
-    const float reportedPeakLinear = bypassed ? maxAbsOutThisBlock : juce::jmax(maxAbsWetOS, maxAbsOutThisBlock);
-    currentTruePeakDb.store(juce::Decibels::gainToDecibels(reportedPeakLinear, -100.0f));
+    // Dedicated True Peak detector: independently re-analyses this exact final output
+    // — after Gain, limiting, Character, the Ceiling clamp and the dry/wet crossfade,
+    // i.e. exactly what is about to reach the host — with its own fixed-factor (8x)
+    // oversampler that never shares state with the OVERSAMPLING selector's own
+    // oversamplers above. That decoupling is deliberate: metering precision must not
+    // change just because the user picked a different processing factor. The True
+    // Peak toggle still only ever decides whether this peak is allowed to *drive gain
+    // reduction* ("True Peak Limiting") — this measurement ("True Peak Meter") always
+    // reports the real reconstructed peak of whatever was actually produced, on or
+    // off, bypassed or not. Copies into a pre-allocated scratch buffer first so this
+    // can never touch what's actually sent to the host.
+    for (int ch = 0; ch < chans; ++ch)
+        dedicatedTpScratch.copyFrom(ch, 0, buffer, ch, 0, numBaseSamples);
+    juce::dsp::AudioBlock<float> tpBlock(dedicatedTpScratch.getArrayOfWritePointers(), (size_t) chans, (size_t) numBaseSamples);
+    auto tpUp = dedicatedTpOversampler->processSamplesUp(tpBlock);
+    float maxAbsTp = 0.0f;
+    for (size_t ch = 0; ch < (size_t) chans; ++ch)
+    {
+        auto* d = tpUp.getChannelPointer(ch);
+        for (size_t i = 0; i < tpUp.getNumSamples(); ++i)
+            if (std::isfinite(d[i])) maxAbsTp = juce::jmax(maxAbsTp, std::abs(d[i]));
+    }
+    currentTruePeakDb.store(juce::Decibels::gainToDecibels(maxAbsTp, -100.0f));
 }

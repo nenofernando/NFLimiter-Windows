@@ -818,13 +818,16 @@ namespace
         check(! m.get().clip, "CLIP is forced off the instant Bypass engages, no stale latch");
     }
 
-    // OVERSAMPLING audit: the 1x/2x/4x/8x selector must be more than a label — it has
-    // to change what the True Peak detector actually sees. At 1x there is no
-    // reconstruction filter at all (the "true peak" IS the decimated sample peak), so
-    // on a genuine intersample-peak provocateur, 1x must measure a lower true peak than
-    // 4x/8x, which do reconstruct the real inter-sample excursion. Also confirms
-    // per-factor latency actually differs (the filters are really being switched, not
-    // just relabelled) and that switching factors mid-stream doesn't produce NaN/Inf.
+    // OVERSAMPLING audit: the 1x/2x/4x/8x selector must be more than a label for the
+    // actual *processing* (proven independently in oversampling_audit.cpp/
+    // oversampling_isolation.cpp: aliasing, the nonlinear stage, and per-factor
+    // latency all genuinely change). The True Peak *meter*, however, is now
+    // deliberately decoupled from this selector — a dedicated, fixed 8x detector (see
+    // LimiterEngine::truePeakDb()'s doc comment) re-analyses the final output on its
+    // own, so the reading must stay consistent across 1x/2x/4x/8x rather than track
+    // the selector. Also confirms per-factor latency actually differs (the processing
+    // filters are really being switched, not just relabelled) and that switching
+    // factors mid-stream doesn't produce NaN/Inf.
     void runOversamplingAudit()
     {
         const double sr = 48000.0;
@@ -860,15 +863,11 @@ namespace
 
         char label[220];
         std::snprintf(label, sizeof(label),
-            "True peak reading on an intersample-peak signal: 1x=%.3f 2x=%.3f 4x=%.3f 8x=%.3f dBTP (1x must read lower — no reconstruction filter)",
+            "True peak reading on an intersample-peak signal: 1x=%.3f 2x=%.3f 4x=%.3f 8x=%.3f dBTP (dedicated detector: must stay consistent regardless of the OVERSAMPLING selector)",
             (double) tp1x, (double) tp2x, (double) tp4x, (double) tp8x);
-        check(tp1x < tp4x - 0.2f, label); // 1x has no reconstruction filter: must clearly under-read vs 4x
-        check(tp1x < tp8x - 0.2f, "1x under-reads vs 8x by the same margin");
-        // 2x/4x/8x each use a different half-band filter cascade, so their exact ripple
-        // on one specific near-Nyquist test tone need not match to a fraction of a dB —
-        // this only checks they're all in the same ballpark (genuinely reconstructing
-        // the peak), not that they're numerically identical.
-        check(std::abs(tp4x - tp8x) < 1.0f, "4x and 8x land in the same ballpark (both meaningfully resolve this signal's real peak)");
+        const float spread = juce::jmax(juce::jmax(tp1x, tp2x), juce::jmax(tp4x, tp8x))
+                            - juce::jmin(juce::jmin(tp1x, tp2x), juce::jmin(tp4x, tp8x));
+        check(spread < 0.5f, label); // the meter must not track the processing selector
 
         // Latency must genuinely differ per factor (proves the actual filters differ,
         // not just a cosmetic index) and must monotonically increase with more taps.

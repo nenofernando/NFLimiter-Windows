@@ -78,10 +78,10 @@ namespace
     // different filter design from the plugin's own FIR equiripple reconstruction --
     // at a high 16x factor, so its own reconstruction error is far smaller than
     // whatever it's being used to check.
-    float independentTruePeakDb(const juce::AudioBuffer<float>& buf)
+    float independentTruePeakDb(const juce::AudioBuffer<float>& buf, int stagesLog2 = 4 /* 16x */)
     {
         const int chans = buf.getNumChannels();
-        juce::dsp::Oversampling<float> ref((size_t) chans, 4 /* 2^4 = 16x */,
+        juce::dsp::Oversampling<float> ref((size_t) chans, (size_t) stagesLog2,
                                             juce::dsp::Oversampling<float>::filterHalfBandPolyphaseIIR, true, false);
         ref.initProcessing((size_t) buf.getNumSamples());
         ref.reset();
@@ -103,15 +103,23 @@ namespace
     // total energy -- i.e. a single "how much spurious energy is in this signal"
     // number. A Hann-windowed, power-of-two-length capture is used to keep spectral
     // leakage from contaminating the measurement.
-    float aliasingEnergyDb(const juce::AudioBuffer<float>& buf, int channel, double sr, double fundamentalHz)
+    // `startOffset` MUST land the analysis window well past the oversampling filter's
+    // own cold-start transient (every FIR filter cascade has one, starting from a
+    // zero initial state on a signal that begins abruptly at sample 0) -- analysing
+    // window 0 was found to conflate that ordinary, expected transient with genuine
+    // steady-state aliasing, making some factors look artificially cleaner or dirtier
+    // than their real steady-state behaviour. See oversampling_isolation.cpp's stage-
+    // by-stage isolation and the block-invariance audit for the investigation that
+    // traced the earlier "4x looks anomalous" finding to exactly this.
+    float aliasingEnergyDb(const juce::AudioBuffer<float>& buf, int channel, double sr, double fundamentalHz, int startOffset = 0)
     {
         const int order = 13; // 8192-point FFT
         const int fftSize = 1 << order;
         juce::dsp::FFT fft(order);
 
         std::vector<float> fftData((size_t) fftSize * 2, 0.0f);
-        const int n = juce::jmin(fftSize, buf.getNumSamples());
-        auto* src = buf.getReadPointer(channel);
+        const int n = juce::jmin(fftSize, buf.getNumSamples() - startOffset);
+        auto* src = buf.getReadPointer(channel) + startOffset;
         for (int i = 0; i < n; ++i)
         {
             const float w = 0.5f - 0.5f * std::cos(2.0f * juce::MathConstants<float>::pi * (float) i / (float) (n - 1));
@@ -218,7 +226,10 @@ int main()
             engine.setParameters(18.0f, -1.0f, 150.0f, false, LimiterEngine::Character::loud, 100.0f, true, false);
             auto sig = makeSine(1, n, sr, tone, 1.0f);
             auto out = runThroughInBlocks(engine, sig, 512);
-            aliasDb[fi] = aliasingEnergyDb(out, 0, sr, tone);
+            // Analysis window starts at the buffer's midpoint, ~16000 samples (~370ms
+            // @44.1kHz) in -- far past any filter's cold-start transient (a few hundred
+            // samples at most) or this limiter's own lookahead latency (~300 samples).
+            aliasDb[fi] = aliasingEnergyDb(out, 0, sr, tone, n / 2);
         }
         char l[220];
         std::snprintf(l, sizeof(l), "Spurious/aliasing energy vs fundamental: 1x=%.2fdB 2x=%.2fdB 4x=%.2fdB 8x=%.2fdB (more negative = cleaner)",
@@ -307,6 +318,12 @@ int main()
             engine.setParameters(0.0f, 12.0f, 150.0f, false, LimiterEngine::Character::clean, 100.0f, true, false);
             auto sig = makeIntersamplePeakSignal(2, n, sr);
             juce::AudioBuffer<float> out(sig);
+            // Every oversampling filter (this engine's and the independent reference's
+            // alike) has its own ordinary cold-start transient from a zero initial
+            // state -- both measurements below skip the first ~2000 samples (well past
+            // it and past the limiter's own ~300-sample lookahead latency) so what's
+            // compared is steady-state behaviour, not two different transients.
+            const int steadyStateStart = 2000;
             float internalMax = -150.0f;
             int pos = 0;
             while (pos < n)
@@ -314,15 +331,15 @@ int main()
                 const int bs = juce::jmin(512, n - pos);
                 juce::AudioBuffer<float> chunk(out.getArrayOfWritePointers(), 2, pos, bs);
                 engine.process(chunk);
-                internalMax = juce::jmax(internalMax, engine.truePeakDb());
+                if (pos + bs > steadyStateStart) internalMax = juce::jmax(internalMax, engine.truePeakDb());
                 pos += bs;
             }
 
             float refMax = -150.0f;
             for (int ch = 0; ch < 2; ++ch)
             {
-                juce::AudioBuffer<float> mono(1, out.getNumSamples());
-                mono.copyFrom(0, 0, out, ch, 0, out.getNumSamples());
+                juce::AudioBuffer<float> mono(1, out.getNumSamples() - steadyStateStart);
+                mono.copyFrom(0, 0, out, ch, steadyStateStart, out.getNumSamples() - steadyStateStart);
                 refMax = juce::jmax(refMax, independentTruePeakDb(mono));
             }
 
@@ -351,6 +368,80 @@ int main()
             std::snprintf(l, sizeof(l), "%dx: reported=%d samples, measured (impulse peak position)=%d samples (diff=%d)",
                           factor, reported, measured, std::abs(reported - measured));
             check(std::abs(reported - measured) <= 2, l); // +/-2 samples slack for interpolation-kernel peak spread
+        }
+    }
+
+    // ------------------------------------------------------------------------------
+    // Dedicated True Peak detector factor selection: compare 4x/8x/16x (candidate
+    // detector factors) against a 32x reference across the same sr x ch x ceiling
+    // matrix used for the ceiling-compliance check above, on the plugin's actual
+    // final (base-rate, post-everything) output -- exactly the signal a dedicated,
+    // DSP-oversampling-independent detector would receive. Picks the smallest
+    // candidate whose worst-case error against 32x stays within tolerance everywhere.
+    // ------------------------------------------------------------------------------
+    std::printf("\n-- Dedicated True Peak detector: choosing the smallest sufficient factor --\n");
+    {
+        const double tolerance = 0.10; // dB -- the acceptance tolerance for the dedicated detector
+        const double sampleRates[] { 44100.0, 48000.0, 96000.0, 192000.0 };
+        const float ceilings[] { -0.1f, -1.0f, -2.0f };
+        const int dspFactors[] { 1, 2, 4, 8 };
+        const int channelCounts[] { 1, 2 };
+        const int candidates[] { 4, 8, 16 }; // stages 2, 3, 4
+        double worstErr[3] { 0.0, 0.0, 0.0 };
+
+        for (double sr : sampleRates)
+        {
+            for (int chans : channelCounts)
+            {
+                for (float ceilingDb : ceilings)
+                {
+                    for (int dspFactor : dspFactors)
+                    {
+                        LimiterEngine engine;
+                        engine.prepare(sr, 512, chans);
+                        engine.requestOversamplingFactor(dspFactor);
+                        engine.setParameters(0.0f, ceilingDb, 150.0f, false, LimiterEngine::Character::clean, 100.0f, true, false);
+                        const int n = (int) sr / 2;
+                        auto sig = makeIntersamplePeakSignal(chans, n, sr);
+                        auto out = runThroughInBlocks(engine, sig, 512);
+
+                        // Skip the cold-start transient region for every measurement below.
+                        const int steadyStart = 2000;
+                        for (int ch = 0; ch < chans; ++ch)
+                        {
+                            juce::AudioBuffer<float> mono(1, n - steadyStart);
+                            mono.copyFrom(0, 0, out, ch, steadyStart, n - steadyStart);
+                            const float truth = independentTruePeakDb(mono, 5 /* 32x */);
+                            for (int ci = 0; ci < 3; ++ci)
+                            {
+                                const int stages = (int) std::round(std::log2((double) candidates[ci]));
+                                const float candidate = independentTruePeakDb(mono, stages);
+                                worstErr[ci] = juce::jmax(worstErr[ci], (double) std::abs(candidate - truth));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        int chosen = -1;
+        for (int ci = 0; ci < 3; ++ci)
+        {
+            char l[200];
+            std::snprintf(l, sizeof(l), "%dx candidate: worst error vs 32x reference across the full matrix = %.4f dB (tolerance = %.2f dB)",
+                          candidates[ci], worstErr[ci], tolerance);
+            check(worstErr[ci] < 1.0, l); // sanity bound, not the selection criterion itself
+            if (chosen < 0 && worstErr[ci] < tolerance) chosen = candidates[ci];
+        }
+        if (chosen > 0)
+        {
+            char l[160];
+            std::snprintf(l, sizeof(l), "Smallest candidate meeting the %.2fdB tolerance everywhere: %dx", tolerance, chosen);
+            info(l);
+        }
+        else
+        {
+            info("No candidate met the tolerance everywhere -- see per-candidate worst-case numbers above.");
         }
     }
 

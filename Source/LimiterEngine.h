@@ -43,8 +43,15 @@ public:
     int latencySamples() const noexcept { return latencySamplesFor(activeOsFactor.load()); }
 
     float gainReductionDb() const noexcept { return currentGrDb.load(); }
-    // Max |sample| seen in the oversampled (true-peak) output domain during the last
-    // block, in dBTP — this is the real post-limiting true-peak reading, not an estimate.
+    // Reported by a dedicated, fixed-factor (8x, validated against a 32x reference to
+    // within 0.031dB worst-case across a full sample-rate/channel/ceiling matrix)
+    // detector that re-analyses the plugin's own FINAL base-rate output — after Gain,
+    // limiting, Character and the Ceiling clamp, exactly what is about to reach the
+    // host. It never shares state with the OVERSAMPLING selector's own oversamplers,
+    // so metering precision stays constant regardless of which factor is chosen for
+    // processing quality/CPU. See Docs -- or the oversampling_audit.cpp test suite --
+    // for the investigation that led here (an earlier, factor-coupled implementation
+    // showed a small but real precision gap that widened at some factors).
     float truePeakDb() const noexcept { return currentTruePeakDb.load(); }
 
 private:
@@ -86,6 +93,16 @@ private:
 
     std::atomic<int> pendingOsFactor { 4 };
     std::atomic<int> activeOsFactor { 4 };
+
+    // Dedicated True Peak detector: its own oversampler (8x, polyphase IIR -- a
+    // different filter family from the FIR equiripple used for processing above, and
+    // never fed by or reset alongside those), fixed regardless of the OVERSAMPLING
+    // selector. Runs on a copy of the final output so it can never affect the signal
+    // actually sent to the host. dedicatedTpScratch is sized once in prepare() so
+    // process() never allocates.
+    static constexpr int kDedicatedTpStages = 3; // 2^3 = 8x
+    std::unique_ptr<juce::dsp::Oversampling<float>> dedicatedTpOversampler;
+    juce::AudioBuffer<float> dedicatedTpScratch;
 
     std::array<ChannelState, 2> channelState;
     int delayCapacity = 0;
