@@ -3,3 +3,4 @@ build-debug/
 *.o
 *.a
 .DS_Store
+build-asan/
