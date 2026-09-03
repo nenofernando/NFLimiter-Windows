@@ -47,7 +47,7 @@ target_link_libraries(NFLimiter PRIVATE juce::juce_audio_utils juce::juce_dsp NF
 
 option(NF_BUILD_TESTS "Build the standalone DSP test harness" ON)
 if(NF_BUILD_TESTS)
-  add_executable(NFLimiterDspTests Tests/dsp_tests.cpp Source/LimiterEngine.cpp)
+  add_executable(NFLimiterDspTests Tests/dsp_tests.cpp Source/LimiterEngine.cpp Source/Metering.cpp)
   target_compile_definitions(NFLimiterDspTests PRIVATE
     JUCE_STANDALONE_APPLICATION=1 JUCE_USE_CURL=0 JUCE_WEB_BROWSER=0)
   target_link_libraries(NFLimiterDspTests PRIVATE

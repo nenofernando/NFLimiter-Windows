@@ -47,6 +47,14 @@ private:
     void parameterChanged(const juce::String& parameterID, float newValue) override;
     void handleAsyncUpdate() override;
 
+    // The history graph's time resolution must not depend on the host's arbitrary
+    // block size (a host using large blocks would otherwise produce a choppy graph
+    // with long flat segments) — processBlock slices the buffer into fixed small
+    // chunks and calls the engine once per chunk, so a history point is pushed every
+    // ~2-3ms of audio regardless of the host's own block size.
+    static constexpr int historyChunkSamples = 128;
+    float displayedGrForHistory = 0.0f; // audio-thread-only: short visual-only smoothing
+
     LimiterEngine limiter;
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(NFLimiterAudioProcessor)
 };

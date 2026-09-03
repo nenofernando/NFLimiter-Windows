@@ -533,42 +533,51 @@ void NFLimiterAudioProcessorEditor::drawHistoryPanel(juce::Graphics& g, juce::Re
         g.drawLine(x, plot.getY(), x, plot.getBottom(), 1.0f);
     }
 
+    // Real data only: gainReductionDb() is published from the DSP's actual applied
+    // gain (Decibels::gainToDecibels(appliedGain)) at a fixed, block-size-independent
+    // cadence (see processBlock's chunking) — never a derived/approximated value, never
+    // input gain or peak. Displayed range is clamped to -24..0dB for the plot only;
+    // NaN/Inf entries are rejected rather than connected into the curve. The newest
+    // point is at the right edge and scrolls left as it ages.
     const int start = processor.historyWrite.load();
     std::vector<juce::Point<float>> tracePts;
     tracePts.reserve((size_t) NFLimiterAudioProcessor::historyLength);
-    bool anyReduction = false;
     for (int i = 0; i < NFLimiterAudioProcessor::historyLength; ++i)
     {
-        const float v = processor.history[(size_t) ((start + i) % NFLimiterAudioProcessor::historyLength)].load();
-        if (v < -0.05f) anyReduction = true;
+        float v = processor.history[(size_t) ((start + i) % NFLimiterAudioProcessor::historyLength)].load();
+        if (! std::isfinite(v)) v = ! tracePts.empty() ? juce::jmap(tracePts.back().y, plot.getY(), plot.getBottom(), 0.0f, -24.0f) : 0.0f;
+        const float displayGrDb = juce::jlimit(-24.0f, 0.0f, v);
         const float x = juce::jmap((float) i, 0.0f, (float) (NFLimiterAudioProcessor::historyLength - 1), plot.getX(), plot.getRight());
-        const float y = juce::jmap(juce::jlimit(-24.0f, 0.0f, v), 0.0f, -24.0f, plot.getY(), plot.getBottom());
+        const float y = juce::jmap(displayGrDb, 0.0f, -24.0f, plot.getY(), plot.getBottom());
         tracePts.push_back({ x, y });
     }
 
-    // No reduction at all in the visible history: leave the well empty (grid only) —
-    // no permanent orange trace or glow when the limiter isn't doing anything.
-    if (! anyReduction) return;
+    juce::Path curve;
+    curve.startNewSubPath(tracePts.front());
+    for (auto& pt : tracePts) curve.lineTo(pt);
 
-    juce::Path p;
-    p.startNewSubPath(tracePts.front());
-    for (auto& pt : tracePts) p.lineTo(pt);
+    // The filled area sits between the 0dB reference line (the plot's top edge) and
+    // the curve — so at rest (curve hugging the top) the fill is naturally a hairline,
+    // and it grows into the "fire" shape exactly in proportion to real reduction, with
+    // no separate empty/idle special-case needed.
+    juce::Path fill;
+    fill.startNewSubPath(plot.getX(), plot.getY());
+    fill.lineTo(tracePts.front());
+    for (auto& pt : tracePts) fill.lineTo(pt);
+    fill.lineTo(plot.getRight(), plot.getY());
+    fill.closeSubPath();
 
-    // A thin glow band under the trace, not a fill down to the axis, so a mostly-flat
-    // history still reads as light activity rather than a solid coloured block.
-    const float glowHeight = juce::jmin(28.0f, plot.getHeight() * 0.22f);
-    juce::Path band;
-    band.startNewSubPath(tracePts.front());
-    for (auto& pt : tracePts) band.lineTo(pt);
-    for (auto it = tracePts.rbegin(); it != tracePts.rend(); ++it)
-        band.lineTo(it->x, juce::jmin(plot.getBottom(), it->y + glowHeight));
-    band.closeSubPath();
+    juce::ColourGradient fireGradient(juce::Colour(0xffff9a00), 0, plot.getY(),
+                                       juce::Colour(0xffff2418), 0, plot.getBottom(), false);
+    fireGradient.addColour(0.5, juce::Colour(0xffff5a00));
+    g.setGradientFill(fireGradient);
+    g.fillPath(fill);
 
-    g.setGradientFill(juce::ColourGradient(NFColour::grOrange.withAlpha(0.5f), 0, plot.getY(),
-                                            NFColour::grOrange.withAlpha(0.0f), 0, plot.getY() + glowHeight, false));
-    g.fillPath(band);
-    g.setColour(NFColour::grOrange);
-    g.strokePath(p, juce::PathStrokeType(1.6f));
+    // Discreet glow behind the line, then a crisp orange stroke on top.
+    g.setColour(juce::Colour(0xffff9a00).withAlpha(0.35f));
+    g.strokePath(curve, juce::PathStrokeType(4.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+    g.setColour(juce::Colour(0xffffaa2e));
+    g.strokePath(curve, juce::PathStrokeType(1.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
 }
 
 void NFLimiterAudioProcessorEditor::drawInfoBox(juce::Graphics& g, juce::Rectangle<float> r, const juce::String& label,

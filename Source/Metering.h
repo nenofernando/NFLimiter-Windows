@@ -22,7 +22,11 @@ public:
     void requestResetIntegrated() noexcept { resetIntegratedRequested.store(true); }
 
     void captureInput(const juce::AudioBuffer<float>& in);
-    void captureOutput(const juce::AudioBuffer<float>& out, float grDb, float truePeakDb);
+    // ceilingDbTP: current ceiling, so CLIP is an overload-vs-ceiling indicator, not a
+    // fixed 0dBTP check. bypassed: forces CLIP off and clears any held state, so a
+    // stale clip from before Bypass was engaged can never keep glowing through it.
+    void captureOutput(const juce::AudioBuffer<float>& out, float grDb, float truePeakDb,
+                        float ceilingDbTP, bool bypassed);
 
     MeterSnapshot get() const;
 
@@ -56,4 +60,5 @@ private:
     std::atomic<float> inL { -100 }, inR { -100 }, outL { -100 }, outR { -100 }, truePeak { -100 };
     std::atomic<float> momentaryLufs { -100 }, gr { 0 };
     std::atomic<bool> clipped { false };
+    int clipHoldSamplesRemaining = 0; // audio-thread-only; get() just reads `clipped`
 };

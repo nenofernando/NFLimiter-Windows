@@ -31,10 +31,20 @@ void LimiterEngine::prepare(double sampleRate, int maximumBlockSize, int newNumC
     delayCapacity = lookaheadOsSamples[kNumOsSlots - 1] + 64;
     minRingCapacity = delayCapacity;
 
+    // Unlike the wet path's lookahead ring (where read trails write by a bounded
+    // lookaheadOs at all times, interleaved sample-by-sample), the dry path writes an
+    // entire block and then reads it back in a second pass — so the ring must hold at
+    // least one full block on top of the latency, or a large block wraps around and
+    // clobbers samples before they're ever read.
+    int maxTotalLatency = 0;
+    for (int i = 0; i < kNumOsSlots; ++i)
+        maxTotalLatency = juce::jmax(maxTotalLatency, lookaheadBaseSamples + osLatencyBaseSamples[(size_t) i]);
+    dryDelayCapacity = maxTotalLatency + juce::jmax(1, maxBlockSize) + 64;
+
     for (auto& cs : channelState)
     {
         cs.delay.assign((size_t) delayCapacity, 0.0f);
-        cs.dryDelay.assign((size_t) delayCapacity, 0.0f);
+        cs.dryBaseDelay.assign((size_t) dryDelayCapacity, 0.0f);
         cs.minIdxRing.assign((size_t) minRingCapacity, (juce::int64) 0);
         cs.minValRing.assign((size_t) minRingCapacity, 0.0f);
     }
@@ -46,7 +56,7 @@ void LimiterEngine::prepare(double sampleRate, int maximumBlockSize, int newNumC
     inputGainSmoothed.reset(baseSampleRate, 0.02);
     ceilingSmoothed.reset(baseSampleRate, 0.02);
     stereoLinkSmoothed.reset(baseSampleRate, 0.02);
-    bypassMix.reset(baseSampleRate, 0.006);
+    bypassMix.reset(baseSampleRate, 0.006); // base rate — the dry crossfade runs post-downsample
     inputGainSmoothed.setCurrentAndTargetValue(1.0f);
     ceilingSmoothed.setCurrentAndTargetValue(0.89125f);
     stereoLinkSmoothed.setCurrentAndTargetValue(1.0f);
@@ -57,11 +67,11 @@ void LimiterEngine::prepare(double sampleRate, int maximumBlockSize, int newNumC
 
 void LimiterEngine::reset()
 {
-    writePos = 0; readPos = 0;
+    writePos = 0; readPos = 0; baseWritePos = 0;
     for (auto& cs : channelState)
     {
         std::fill(cs.delay.begin(), cs.delay.end(), 0.0f);
-        std::fill(cs.dryDelay.begin(), cs.dryDelay.end(), 0.0f);
+        std::fill(cs.dryBaseDelay.begin(), cs.dryBaseDelay.end(), 0.0f);
         cs.minHead = 0; cs.minCount = 0; cs.currentGain = 1.0f; cs.heldDigitalPeak = 0.0f;
     }
     for (auto& os : oversamplers) if (os) os->reset();
@@ -74,11 +84,11 @@ void LimiterEngine::switchToPendingFactorIfNeeded()
     if (wanted == activeOsFactor.load()) return;
 
     activeOsFactor.store(wanted);
-    writePos = 0; readPos = 0;
+    writePos = 0; readPos = 0; baseWritePos = 0;
     for (auto& cs : channelState)
     {
         std::fill(cs.delay.begin(), cs.delay.end(), 0.0f);
-        std::fill(cs.dryDelay.begin(), cs.dryDelay.end(), 0.0f);
+        std::fill(cs.dryBaseDelay.begin(), cs.dryBaseDelay.end(), 0.0f);
         cs.minHead = 0; cs.minCount = 0; cs.currentGain = 1.0f; cs.heldDigitalPeak = 0.0f;
     }
     const int idx = factorToIndex(wanted);
@@ -88,7 +98,7 @@ void LimiterEngine::switchToPendingFactorIfNeeded()
     inputGainSmoothed.reset(osRate, 0.02);
     ceilingSmoothed.reset(osRate, 0.02);
     stereoLinkSmoothed.reset(osRate, 0.02);
-    bypassMix.reset(osRate, 0.006);
+    // bypassMix runs at the base rate and is unaffected by the oversampling factor.
 }
 
 void LimiterEngine::setParameters(float inputGainDb, float ceilingDbTP, float releaseMsIn, bool autoReleaseIn,
@@ -161,6 +171,23 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
     const int factor = activeOsFactor.load();
     const int idx = factorToIndex(factor);
     const int chans = juce::jmin(numChannels, buffer.getNumChannels());
+    const int numBaseSamples = buffer.getNumSamples();
+
+    // Capture the untouched dry signal at the BASE rate, before oversampling even
+    // begins — a pure sample delay that never runs through the oversampling filters,
+    // so bypass is bit-exact (not just gain/limiter-free). It will be read back
+    // latencySamples() behind the input, so it lands in perfect sync with the wet path.
+    for (int ch = 0; ch < chans; ++ch)
+    {
+        auto& cs = channelState[(size_t) ch];
+        auto* d = buffer.getReadPointer(ch);
+        for (int n = 0; n < numBaseSamples; ++n)
+        {
+            float raw = d[n];
+            if (! std::isfinite(raw)) raw = 0.0f;
+            cs.dryBaseDelay[(size_t) ((baseWritePos + n) % dryDelayCapacity)] = raw;
+        }
+    }
 
     juce::dsp::AudioBlock<float> block(buffer);
     juce::dsp::AudioBlock<float> osBlock = block;
@@ -171,17 +198,13 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
     const int lookaheadOs = lookaheadOsSamples[(size_t) idx];
     const double osSampleRate = baseSampleRate * (double) factor;
     float minGainThisBlock = 1.0f;
-    float maxAbsOutThisBlock = 0.0f;
+    float maxAbsWetOS = 0.0f; // oversampled (genuine true-peak) reading of the wet signal
 
     for (int i = 0; i < osNumSamples; ++i)
     {
         const float gainNow = inputGainSmoothed.getNextValue();
         const float ceilNow = ceilingSmoothed.getNextValue();
         const float linkNow = stereoLinkSmoothed.getNextValue();
-        // Bypass is a request, not an instant switch: crossfade the output between the
-        // dry and wet paths over a few ms so toggling it never clicks.
-        bypassMix.setTargetValue(bypassed ? 1.0f : 0.0f);
-        const float mixToDry = bypassMix.getNextValue();
 
         float peak[2] { 0.0f, 0.0f };
         for (int ch = 0; ch < chans; ++ch)
@@ -189,7 +212,6 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
             auto& cs = channelState[(size_t) ch];
             float xRaw = osBlock.getChannelPointer((size_t) ch)[i];
             if (! std::isfinite(xRaw)) xRaw = 0.0f;
-            cs.dryDelay[(size_t) (writePos % delayCapacity)] = xRaw; // untouched — Gain never applied here
 
             // Gain is applied exactly once, right here, only for the wet (limited) path.
             const float xGained = xRaw * gainNow;
@@ -236,14 +258,10 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
                 float wet = cs.delay[(size_t) (readPos % delayCapacity)] * cs.currentGain;
                 applyCharacter(wet);
                 wet = juce::jlimit(-ceilNow, ceilNow, wet); // last-resort safety net, not the primary mechanism
-                const float dry = cs.dryDelay[(size_t) (readPos % delayCapacity)];
+                osBlock.getChannelPointer((size_t) ch)[i] = wet;
 
-                const float y = wet + mixToDry * (dry - wet);
-                osBlock.getChannelPointer((size_t) ch)[i] = y;
-
-                const float effectiveGain = cs.currentGain + mixToDry * (1.0f - cs.currentGain);
-                minGainThisBlock = juce::jmin(minGainThisBlock, effectiveGain);
-                maxAbsOutThisBlock = juce::jmax(maxAbsOutThisBlock, std::abs(y));
+                minGainThisBlock = juce::jmin(minGainThisBlock, cs.currentGain);
+                maxAbsWetOS = juce::jmax(maxAbsWetOS, std::abs(wet));
             }
             ++readPos;
         }
@@ -277,6 +295,42 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
         }
     }
 
-    currentGrDb.store(juce::Decibels::gainToDecibels(minGainThisBlock, -60.0f));
-    currentTruePeakDb.store(juce::Decibels::gainToDecibels(maxAbsOutThisBlock, -100.0f));
+    // Dry/wet crossfade happens here, at the base rate, after the wet path has been
+    // fully computed and downsampled — the dry sample never touches the oversampling
+    // filters (see the capture loop at the top), so at mix=1 (fully bypassed) this is a
+    // bit-exact pass-through, not an approximation. `buffer` holds the wet result now;
+    // blend in the latency-aligned dry sample by however far bypassMix has ramped.
+    const int totalLatency = latencySamplesFor(factor);
+    float maxAbsOutThisBlock = 0.0f;
+    float finalMix = 0.0f;
+    for (int n = 0; n < numBaseSamples; ++n)
+    {
+        bypassMix.setTargetValue(bypassed ? 1.0f : 0.0f);
+        const float mix = bypassMix.getNextValue();
+        finalMix = mix;
+        const juce::int64 srcAbs = baseWritePos + n - totalLatency;
+
+        for (int ch = 0; ch < chans; ++ch)
+        {
+            auto& cs = channelState[(size_t) ch];
+            auto* d = buffer.getWritePointer(ch);
+            const float dry = srcAbs >= 0 ? cs.dryBaseDelay[(size_t) (srcAbs % dryDelayCapacity)] : 0.0f;
+            const float y = d[n] + mix * (dry - d[n]);
+            d[n] = y;
+            maxAbsOutThisBlock = juce::jmax(maxAbsOutThisBlock, std::abs(y));
+        }
+    }
+    baseWritePos += numBaseSamples;
+
+    // While mostly/fully bypassed, gain reduction reads back toward 0dB in step with
+    // the same crossfade, so the meter never lingers on a stale reduction value.
+    const float reportedGain = minGainThisBlock + finalMix * (1.0f - minGainThisBlock);
+    currentGrDb.store(juce::Decibels::gainToDecibels(reportedGain, -60.0f));
+
+    // The metered peak follows the True Peak toggle, same as the detector: with it on,
+    // report the genuine oversampled (intersample) peak of the wet signal; with it off,
+    // report a plain decimated sample peak — so the toggle visibly changes the reading,
+    // not just an inaudible internal detail. Bypassed always reports the real output.
+    const float reportedPeakLinear = (bypassed || ! truePeakEnabled) ? maxAbsOutThisBlock : juce::jmax(maxAbsWetOS, maxAbsOutThisBlock);
+    currentTruePeakDb.store(juce::Decibels::gainToDecibels(reportedPeakLinear, -100.0f));
 }

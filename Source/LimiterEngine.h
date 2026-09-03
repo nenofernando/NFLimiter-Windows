@@ -56,7 +56,11 @@ private:
     struct ChannelState
     {
         std::vector<float> delay;               // ring buffer of GAINED oversampled samples (wet path)
-        std::vector<float> dryDelay;             // ring buffer of the RAW input, gain never applied
+        std::vector<float> dryBaseDelay;         // base-rate ring buffer of the RAW input — a pure sample
+                                                  // delay that never touches the oversampling filters, so
+                                                  // bypass is bit-exact (gain never applied, filters never
+                                                  // run on it), while still landing exactly latencySamples()
+                                                  // behind the input, matching the wet path's latency.
         std::vector<juce::int64> minIdxRing;
         std::vector<float> minValRing;
         int minHead = 0, minCount = 0;
@@ -88,9 +92,13 @@ private:
     int minRingCapacity = 0;
     juce::int64 writePos = 0, readPos = 0;
 
+    int dryDelayCapacity = 0;
+    juce::int64 baseWritePos = 0;
+
     juce::SmoothedValue<float> inputGainSmoothed, ceilingSmoothed, stereoLinkSmoothed;
-    // 0 = fully wet (processed), 1 = fully dry (bypassed) — ramped over a few ms so
-    // toggling Bypass crossfades instead of switching paths on a single sample.
+    // 0 = fully wet (processed), 1 = fully dry (bypassed) — ramped over a few ms (at the
+    // base sample rate, applied after downsampling) so toggling Bypass crossfades
+    // instead of switching paths on a single sample.
     juce::SmoothedValue<float> bypassMix;
     float releaseMs = 150.0f;
     bool autoRelease = true;

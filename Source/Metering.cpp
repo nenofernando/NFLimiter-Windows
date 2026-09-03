@@ -64,7 +64,7 @@ void Metering::reset()
     gatingHead = 0; gatingCount = 0;
     resetIntegratedRequested.store(false);
     inL = inR = outL = outR = truePeak = -100.0f;
-    momentaryLufs = -100.0f; gr = 0.0f; clipped = false;
+    momentaryLufs = -100.0f; gr = 0.0f; clipped = false; clipHoldSamplesRemaining = 0;
 }
 
 void Metering::captureInput(const juce::AudioBuffer<float>& b)
@@ -73,7 +73,8 @@ void Metering::captureInput(const juce::AudioBuffer<float>& b)
     inR = peakDb(b, juce::jmin(1, b.getNumChannels() - 1));
 }
 
-void Metering::captureOutput(const juce::AudioBuffer<float>& b, float grDb, float truePeakDbIn)
+void Metering::captureOutput(const juce::AudioBuffer<float>& b, float grDb, float truePeakDbIn,
+                              float ceilingDbTP, bool bypassed)
 {
     if (resetIntegratedRequested.exchange(false))
     {
@@ -86,7 +87,27 @@ void Metering::captureOutput(const juce::AudioBuffer<float>& b, float grDb, floa
     outR = peakDb(b, juce::jmin(1, b.getNumChannels() - 1));
     gr = grDb;
     truePeak = truePeakDbIn;
-    clipped = truePeakDbIn >= 0.0f;
+
+    // CLIP is an overload-vs-ceiling indicator (never a clipper control): it lights
+    // when the post-limiter, post-oversampling, post-ceiling true peak exceeds the
+    // *current* ceiling by more than a hair (filter-ringing headroom), holds briefly
+    // so a fast transient is actually seen, then clears on its own. Bypass always wins:
+    // no leftover latch can glow through it.
+    static constexpr float kClipMarginDb = 0.05f;
+    static constexpr double kClipHoldSeconds = 0.7; // within the requested 500-1000ms
+    if (bypassed)
+    {
+        clipHoldSamplesRemaining = 0;
+        clipped = false;
+    }
+    else
+    {
+        if (truePeakDbIn > ceilingDbTP + kClipMarginDb)
+            clipHoldSamplesRemaining = juce::jmax(clipHoldSamplesRemaining, (int) std::round(kClipHoldSeconds * sampleRate));
+        else
+            clipHoldSamplesRemaining = juce::jmax(0, clipHoldSamplesRemaining - b.getNumSamples());
+        clipped = clipHoldSamplesRemaining > 0;
+    }
 
     const int n = b.getNumSamples();
     const int chans = juce::jmin(channels, b.getNumChannels());

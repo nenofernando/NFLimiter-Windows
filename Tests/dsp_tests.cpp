@@ -5,6 +5,7 @@
 // It also runs an automation pass on every smoothed parameter and reports the largest
 // sample-to-sample discontinuity seen, as a proxy for zipper/click artifacts.
 #include "../Source/LimiterEngine.h"
+#include "../Source/Metering.h"
 #include <cstdio>
 #include <random>
 
@@ -281,22 +282,19 @@ namespace
         check(maxDiff < 1.0e-6f, label);
     }
 
-    // Null test: bypassed output minus the (latency-aligned) input should be near
-    // digital silence, for a variety of gain settings. The residual isn't exactly zero:
-    // per the fix's requirement that the dry path receive *exactly* the wet path's
-    // latency, bypassed audio still round-trips through the same oversampling up/down
-    // filter pair (that's what keeps the latency identical and click-free when toggling
-    // mid-stream) — a well-designed half-band filter's own passband ripple/insertion
-    // loss on that round trip, independent of gain, is the entire residual. Threshold
-    // is set at -40dB relative to signal amplitude, comfortably above that filter
-    // ripple floor and comfortably below anything an actual logic bug would produce.
+    // Null test: bypassed output minus the (latency-aligned) input must be at or below
+    // -120dBFS. The dry path is a pure base-rate sample delay that never touches the
+    // oversampling filters, gain, character, or ceiling clamp, so this should be at (or
+    // near) the limit of float32 precision, not just "small".
     void runBypassNullTest()
     {
         const double sr = 48000.0;
         const int n = (int) sr;
         const float amplitude = 0.35f;
-        const float thresholdDb = -40.0f;
-        const float threshold = amplitude * juce::Decibels::decibelsToGain(thresholdDb);
+        const float thresholdDb = -120.0f;
+        // decibelsToGain's default floor is -100dB (returns 0 below that), which would
+        // make a -120dB threshold always fail trivially — give it an explicit lower floor.
+        const float threshold = amplitude * juce::Decibels::decibelsToGain(thresholdDb, -160.0f);
 
         for (float gainDb : { 0.0f, 6.0f, 24.0f, -6.0f })
         {
@@ -402,6 +400,106 @@ namespace
         std::snprintf(label, sizeof(label), "Bypass ON reports 0.0dB gain reduction (got %.3f dB)", (double) engine.gainReductionDb());
         check(std::abs(engine.gainReductionDb()) < 0.05f, label);
     }
+
+    // Gain x Ceiling matrix: for every combination, the true peak of the actual output
+    // must never exceed the ceiling by more than 0.05dB.
+    void runGainCeilingMatrixCheck()
+    {
+        const double sr = 48000.0;
+        const int n = (int) sr;
+        for (float gainDb : { 0.0f, 6.0f, 12.0f, 24.0f })
+        {
+            for (float ceilDb : { -0.1f, -1.0f, -2.0f, -6.0f })
+            {
+                LimiterEngine engine;
+                engine.prepare(sr, 512, 2);
+                engine.setParameters(gainDb, ceilDb, 150.0f, true, LimiterEngine::Character::loud, 100.0f, true, false);
+                auto signal = makeSine(2, n, sr, 733.0, 0.9f);
+                auto out = runThroughInBlocks(engine, signal, { 512 });
+                const float ceilGain = juce::Decibels::decibelsToGain(ceilDb);
+                const float peak = maxAbs(out);
+                const float overshootDb = juce::Decibels::gainToDecibels(peak / ceilGain);
+                char label[192];
+                std::snprintf(label, sizeof(label), "Gain=%.0fdB Ceiling=%.1fdBTP: true peak overshoot = %.3f dB (limit 0.05)",
+                              (double) gainDb, (double) ceilDb, (double) overshootDb);
+                check(overshootDb < 0.05f, label);
+            }
+        }
+    }
+
+    // Stereo Link: an asymmetric signal (impulsive left, constant quiet-under-ceiling
+    // right) proves the link actually couples the two channels' envelopes, rather than
+    // just being wired to a parameter nobody reads.
+    void runStereoLinkAsymmetricCheck()
+    {
+        const double sr = 48000.0;
+        const int n = (int) sr;
+        std::mt19937 rng(42);
+
+        auto render = [&](float linkPercent)
+        {
+            LimiterEngine engine;
+            engine.prepare(sr, 512, 2);
+            engine.setParameters(0.0f, -1.0f, 150.0f, true, LimiterEngine::Character::clean, linkPercent, true, false);
+            juce::AudioBuffer<float> in(2, n);
+            auto left = makeImpulses(1, n, 4800, 3.0f);
+            auto right = makeSine(1, n, sr, 300.0, 0.5f);
+            in.copyFrom(0, 0, left, 0, 0, n);
+            in.copyFrom(1, 0, right, 0, 0, n);
+            auto out = runThroughInBlocks(engine, in, { 512 });
+            const int latency = engine.latencySamples();
+            double sumSq = 0.0; int count = 0;
+            for (int i = latency + 100; i < n; ++i) { const float v = out.getSample(1, i); sumSq += (double) v * v; ++count; }
+            return (float) std::sqrt(sumSq / juce::jmax(1, count));
+        };
+
+        const float rmsLink0 = render(0.0f);
+        const float rmsLink50 = render(50.0f);
+        const float rmsLink100 = render(100.0f);
+
+        char l1[192], l2[192], l3[192];
+        std::snprintf(l1, sizeof(l1), "Link=0%%: right channel RMS = %.4f (independent — left's impulses must not duck it)", (double) rmsLink0);
+        std::snprintf(l2, sizeof(l2), "Link=100%%: right channel RMS = %.4f, reduced from Link=0%%'s %.4f (left's impulses duck it via shared detector)", (double) rmsLink100, (double) rmsLink0);
+        std::snprintf(l3, sizeof(l3), "Link=50%% (%.4f) sits between Link=0%% (%.4f) and Link=100%% (%.4f)", (double) rmsLink50, (double) rmsLink0, (double) rmsLink100);
+
+        check(rmsLink0 > 0.32f, l1); // ideal unaffected RMS is 0.5/sqrt(2)=0.3536; link=0 leaves it essentially untouched
+        check(rmsLink100 < rmsLink0 * 0.95f, l2); // measurable ducking once linked to left's impulses
+        check(rmsLink100 <= rmsLink50 + 1.0e-4f && rmsLink50 <= rmsLink0 + 1.0e-4f, l3); // monotonic in between
+    }
+
+    // CLIP: must be an overload-vs-ceiling indicator (never itself a clipper), triggered
+    // strictly by true peak exceeding ceiling+0.05dB, held for ~700ms, and forced off
+    // (no stale latch) the instant Bypass engages.
+    void runClipIndicatorCheck()
+    {
+        const double sr = 48000.0;
+        Metering m;
+        m.prepare(sr, 2);
+
+        juce::AudioBuffer<float> quiet(2, 64);
+        quiet.clear();
+        m.captureInput(quiet);
+        m.captureOutput(quiet, 0.0f, -3.0f, -1.0f, false); // -3dBTP vs -1dBTP ceiling: well under
+        check(! m.get().clip, "CLIP stays off when true peak is well under ceiling+0.05dB");
+
+        m.captureOutput(quiet, -2.0f, -0.8f, -1.0f, false); // -0.8dBTP vs -1dBTP+0.05=-0.95: exceeds -> triggers
+        check(m.get().clip, "CLIP turns on when true peak exceeds ceiling+0.05dB");
+
+        // Immediately drop back under the threshold: CLIP must still hold (not clear instantly).
+        m.captureOutput(quiet, 0.0f, -3.0f, -1.0f, false);
+        check(m.get().clip, "CLIP holds briefly after the overload ends, instead of blinking off instantly");
+
+        // Simulate ~750ms of silence (past the ~700ms hold) in 64-sample steps.
+        const int steps = (int) std::ceil(0.75 * sr / 64.0);
+        for (int i = 0; i < steps; ++i) m.captureOutput(quiet, 0.0f, -3.0f, -1.0f, false);
+        check(! m.get().clip, "CLIP clears on its own after the hold window elapses");
+
+        // Bypass must force it off immediately, never reusing an old latched state.
+        m.captureOutput(quiet, -2.0f, -0.8f, -1.0f, false);
+        check(m.get().clip, "(setup) CLIP is latched on before the bypass check");
+        m.captureOutput(quiet, 0.0f, -0.8f, -1.0f, true); // bypass engaged mid-overload
+        check(! m.get().clip, "CLIP is forced off the instant Bypass engages, no stale latch");
+    }
 }
 
 int main()
@@ -434,6 +532,15 @@ int main()
 
     std::printf("\n-- Bypass reports 0.0dB gain reduction --\n");
     runBypassReportsZeroGrCheck();
+
+    std::printf("\n-- Gain x Ceiling matrix (true peak must never exceed ceiling by > 0.05dB) --\n");
+    runGainCeilingMatrixCheck();
+
+    std::printf("\n-- Stereo Link asymmetric check (impulsive L, quiet constant R) --\n");
+    runStereoLinkAsymmetricCheck();
+
+    std::printf("\n-- CLIP indicator check --\n");
+    runClipIndicatorCheck();
 
     std::printf("\n== %d failure(s), %d warning(s) ==\n", failures, warnings);
     return failures == 0 ? 0 : 1;

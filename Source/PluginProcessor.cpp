@@ -95,13 +95,42 @@ void NFLimiterAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
     const int factor = oversamplingFactorFromChoice(raw("oversampling"));
     limiter.requestOversamplingFactor(factor);
 
+    const bool bypassedNow = raw("bypass") > 0.5f;
     limiter.setParameters(raw("gain"), raw("ceiling"), raw("release"), raw("auto_release") > 0.5f,
                            (LimiterEngine::Character) juce::roundToInt(raw("character")),
-                           raw("stereo_link"), raw("true_peak") > 0.5f, raw("bypass") > 0.5f);
-    limiter.process(buffer);
+                           raw("stereo_link"), raw("true_peak") > 0.5f, bypassedNow);
 
-    metering.captureOutput(buffer, limiter.gainReductionDb(), limiter.truePeakDb());
-    history[(size_t) (historyWrite.fetch_add(1) % historyLength)] = limiter.gainReductionDb();
+    // Process in fixed-size sub-chunks (block-size-invariant DSP — proven by the test
+    // suite) purely so the history graph gets a data point roughly every 2-3ms, not
+    // once per host callback, which is what produced the choppy/steppy look on hosts
+    // using large block sizes.
+    float blockMinGrDb = 0.0f;
+    int pos = 0;
+    const int totalSamples = buffer.getNumSamples();
+    while (pos < totalSamples)
+    {
+        const int chunk = juce::jmin(historyChunkSamples, totalSamples - pos);
+        juce::AudioBuffer<float> sub(buffer.getArrayOfWritePointers(), buffer.getNumChannels(), pos, chunk);
+        limiter.process(sub);
+
+        float target = limiter.gainReductionDb();
+        if (! std::isfinite(target)) target = 0.0f;
+        blockMinGrDb = juce::jmin(blockMinGrDb, target);
+
+        // Visual-only ballistics for the history graph (never affects audio or the
+        // numeric GR readout, which reads Metering's own value): attack is immediate
+        // so real transients are never smeared away, release is briefly smoothed so
+        // the trace doesn't flicker sample-to-sample, and it eases back to 0dB rather
+        // than showing a stale reduction while Bypass is engaged.
+        if (bypassedNow) displayedGrForHistory += 0.35f * (0.0f - displayedGrForHistory);
+        else if (target < displayedGrForHistory) displayedGrForHistory = target;
+        else displayedGrForHistory += 0.25f * (target - displayedGrForHistory);
+
+        history[(size_t) (historyWrite.fetch_add(1) % historyLength)] = displayedGrForHistory;
+        pos += chunk;
+    }
+
+    metering.captureOutput(buffer, blockMinGrDb, limiter.truePeakDb(), raw("ceiling"), bypassedNow);
 }
 
 void NFLimiterAudioProcessor::parameterChanged(const juce::String& parameterID, float)
