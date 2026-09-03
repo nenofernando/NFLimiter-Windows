@@ -9,9 +9,11 @@ else()
   find_package(JUCE CONFIG REQUIRED)
 endif()
 option(NF_BUILD_AAX "Build AAX when Avid SDK is configured" OFF)
+set(NF_AAX_SDK_PATH "" CACHE PATH "Path to the Avid AAX SDK root")
 set(NF_FORMATS AU VST3 Standalone)
 if(NF_BUILD_AAX)
   list(APPEND NF_FORMATS AAX)
+  juce_set_aax_sdk_path("${NF_AAX_SDK_PATH}")
 endif()
 juce_add_plugin(NFLimiter
   COMPANY_NAME "NF Audio Tools"
@@ -39,7 +41,9 @@ target_compile_definitions(NFLimiter PUBLIC JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 J
 # image are used for geometry/texture only, never as literal overlaid images.
 juce_add_binary_data(NFLimiterResources SOURCES
   Docs/MANUAL_PT.md
-  Docs/MANUAL_EN.md)
+  Docs/MANUAL_EN.md
+  Assets/Manual/overview.png
+  Assets/Manual/controls.png)
 set_target_properties(NFLimiterResources PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_link_libraries(NFLimiter PRIVATE juce::juce_audio_utils juce::juce_dsp NFLimiterResources

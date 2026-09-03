@@ -39,12 +39,13 @@ public:
     juce::AudioProcessorValueTreeState apvts;
     PresetManager presets;
     Metering metering;
-    // 600 buckets at ~8ms each ≈ 4.8s of real GAIN REDUCTION history (not a spectrum
-    // analyser — this is gain reduction over time). Bucket duration is fixed in
+    // 960 buckets at 5ms each ≈ 4.8s of real GAIN REDUCTION history (not a spectrum
+    // analyser — this is gain reduction over time), same total span as the previous
+    // 600 * 8ms — only the time resolution changed. Bucket duration is fixed in
     // *milliseconds*, converted to samples from the actual sample rate in
     // prepareToPlay(), so the represented time span stays ~5s regardless of whether
     // the host runs at 44.1kHz or 192kHz.
-    static constexpr int historyLength = 600;
+    static constexpr int historyLength = 960;
     std::array<std::atomic<float>, historyLength> history {};
     std::atomic<int> historyWrite { 0 };
 
@@ -52,7 +53,9 @@ private:
     void parameterChanged(const juce::String& parameterID, float newValue) override;
     void handleAsyncUpdate() override;
 
-    static constexpr double historyBucketMs = 8.0;
+    // 5ms buckets (was 8ms) so narrow drum-hit-length gain-reduction transients get
+    // their own bucket instead of being merged into a wider window.
+    static constexpr double historyBucketMs = 5.0;
     int historyChunkSamples = 128; // recomputed from the real sample rate in prepareToPlay
     float displayedGrForHistory = 0.0f; // audio-thread-only: short visual-only smoothing
 

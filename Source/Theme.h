@@ -52,6 +52,20 @@ public:
         setColour(juce::ToggleButton::tickColourId, NFColour::accentBlue);
     }
 
+    // Centres the preset name in the combo box instead of the default left-aligned
+    // layout, so "Default" reads centred on the same axis as the PEAK/TRUE PEAK/
+    // LUFS column beneath it rather than looking shifted left within its own pill.
+    void positionComboBoxText(juce::ComboBox& box, juce::Label& label) override
+    {
+        label.setBounds(1, 1, box.getWidth() - 2, box.getHeight() - 2);
+        label.setJustificationType(juce::Justification::centred);
+    }
+
+    // No native background/outline/arrow: the dedicated prev/next buttons either side
+    // are the click affordance already, so a drawn arrow would only collide with the
+    // now-centred preset name.
+    void drawComboBox(juce::Graphics&, int, int, bool, int, int, int, int, juce::ComboBox&) override {}
+
     // Layered knob render, built in this order: drop shadow, 21 indicator dots, two
     // metal bezel rings, a 64-slice radial brushed-aluminium body, a radial light/dark
     // gradient, a corner highlight/shadow pair, and a short rounded marker. The accent
@@ -172,6 +186,44 @@ public:
         g.drawText(btn.getButtonText(), bounds.toNearestInt(), juce::Justification::centred);
     }
 
+    // Below: a passive, non-interactive warning indicator — not a button, no hover/
+    // pressed/toggle state, no clip control of any kind.
+    static void paintTruePeakOverIndicator(juce::Graphics& g, juce::Rectangle<float> bounds, bool lit)
+    {
+        auto textArea = bounds.removeFromBottom(bounds.getHeight() * 0.54f);
+        auto ledArea = bounds;
+        const float d = juce::jmin(ledArea.getWidth(), ledArea.getHeight()) * 0.6f;
+        juce::Rectangle<float> led(d, d);
+        led.setCentre(ledArea.getCentreX(), ledArea.getCentreY());
+
+        if (lit)
+        {
+            // Lit: vivid red centre, a small white hot-spot for a luminous look, and a
+            // soft red glow around it.
+            g.setColour(juce::Colour(0xffff2020).withAlpha(0.4f));
+            g.fillEllipse(led.expanded(d * 0.65f));
+            g.setGradientFill(juce::ColourGradient(juce::Colours::white, led.getCentreX(), led.getCentreY(),
+                                                    juce::Colour(0xffe0140f), led.getX(), led.getY(), true));
+            g.fillEllipse(led);
+            g.setColour(juce::Colours::white.withAlpha(0.95f));
+            g.fillEllipse(juce::Rectangle<float>(d * 0.16f, d * 0.16f).withCentre(led.getCentre()));
+            g.setColour(juce::Colours::white.withAlpha(0.55f));
+            g.drawEllipse(led, 1.0f);
+        }
+        else
+        {
+            // Off: a dark, discreet, clearly-passive wine-red disc — no glow at all.
+            g.setColour(juce::Colour(0xff2a0a0c));
+            g.fillEllipse(led);
+            g.setColour(juce::Colours::black.withAlpha(0.65f));
+            g.drawEllipse(led, 1.0f);
+        }
+
+        g.setColour(lit ? juce::Colour(0xffff4030) : NFColour::textDim.withAlpha(0.55f));
+        g.setFont(juce::Font(juce::FontOptions(juce::jmax(8.5f, textArea.getHeight() * 0.30f), juce::Font::bold)).withExtraKerningFactor(0.04f));
+        g.drawFittedText("TRUE PEAK\nOVER", textArea.toNearestInt(), juce::Justification::centred, 2);
+    }
+
     void drawButtonBackground(juce::Graphics& g, juce::Button& btn, const juce::Colour&,
                                bool highlighted, bool down) override
     {
@@ -230,6 +282,44 @@ public:
     void drawButtonText(juce::Graphics& g, juce::TextButton& btn, bool, bool) override
     {
         g.setColour(btn.getToggleState() ? juce::Colours::white : NFColour::textDim);
+
+        if (btn.getComponentID() == "character")
+        {
+            // CLEAN / PUNCH / LOUD share one axis, one width and must render at one
+            // shared size, spelled out in full — never abbreviated or ellipsised. The
+            // size is derived from the widest label (PUNCH) so all three match exactly,
+            // regardless of which button is actually being painted right now.
+            const float availableWidth = juce::jmax(1.0f, (float) btn.getWidth() - 10.0f);
+            auto fits = [&] (float size)
+            {
+                return juce::GlyphArrangement::getStringWidth(juce::Font(juce::FontOptions(size, juce::Font::bold)), "PUNCH") <= availableWidth;
+            };
+
+            float fontSize = juce::jlimit(9.0f, 15.0f, (float) btn.getHeight() * 0.34f);
+            while (fontSize > 8.0f && ! fits(fontSize)) fontSize -= 0.5f;
+
+            float hScale = 1.0f;
+            const float widestAtSize = juce::GlyphArrangement::getStringWidth(juce::Font(juce::FontOptions(fontSize, juce::Font::bold)), "PUNCH");
+            if (widestAtSize > availableWidth)
+                hScale = juce::jmax(0.9f, availableWidth / widestAtSize);
+
+            auto f = juce::Font(juce::FontOptions(fontSize, juce::Font::bold));
+            f.setHorizontalScale(hScale);
+            g.setFont(f);
+            g.drawText(btn.getButtonText(), btn.getLocalBounds(), juce::Justification::centred, false);
+            return;
+        }
+
+        if (btn.getComponentID() == "oversampling")
+        {
+            // Same row, same button height as CHARACTER — 1x/2x/4x/8x must read at the
+            // identical point size as CLEAN/PUNCH/LOUD, not the generic per-button size.
+            const float fontSize = juce::jlimit(9.0f, 15.0f, (float) btn.getHeight() * 0.34f);
+            g.setFont(juce::Font(juce::FontOptions(fontSize, juce::Font::bold)));
+            g.drawText(btn.getButtonText(), btn.getLocalBounds(), juce::Justification::centred, false);
+            return;
+        }
+
         const float fontSize = juce::jlimit(12.0f, 22.0f, (float) btn.getHeight() * 0.4f);
         g.setFont(juce::Font(juce::FontOptions(fontSize, juce::Font::bold)));
         g.drawText(btn.getButtonText(), btn.getLocalBounds(), juce::Justification::centred);

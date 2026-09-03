@@ -94,7 +94,7 @@ void Metering::captureOutput(const juce::AudioBuffer<float>& b, float grDb, floa
     // so a fast transient is actually seen, then clears on its own. Bypass always wins:
     // no leftover latch can glow through it.
     static constexpr float kClipMarginDb = 0.05f;
-    static constexpr double kClipHoldSeconds = 0.7; // within the requested 500-1000ms
+    static constexpr double kClipHoldSeconds = 1.0;
     if (bypassed)
     {
         clipHoldSamplesRemaining = 0;

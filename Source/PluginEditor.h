@@ -38,12 +38,19 @@ private:
     juce::AffineTransform designToScreen() const;
     juce::Rectangle<int> map(juce::Rectangle<float> designRect) const;
 
+    // The single official centre axis for every centred element (title, subtitle, GR
+    // block, TRUE PEAK label+button, ...): the GAIN REDUCTION panel's own centreX, in
+    // design-space units. Because the whole layout is uniformly scaled as one unit
+    // (designToScreen()), anything centred on this axis in design space stays centred
+    // at every window size — there is no separate per-size correction anywhere.
+    static float getMainProcessingAxisX();
+
     void timerCallback() override;
     void refreshPresetList();
     void stepPreset(int direction);
     void requestSavePreset();
     void showMainMenu();
-    void showManualDialog(const juce::String& title, const juce::String& text);
+    void showManualDialog(const juce::String& title, bool portuguese);
 
     void drawPanel(juce::Graphics&, juce::Rectangle<float>);
     void drawTitle(juce::Graphics&, juce::Rectangle<float>, const juce::String&, float fontSize = 15.0f);
@@ -73,6 +80,25 @@ private:
 
     juce::ComponentBoundsConstrainer constrainer;
     juce::ResizableCornerComponent resizer;
+
+    // Passive warning light only — never a button. See Theme.h's
+    // NFLookAndFeel::paintTruePeakOverIndicator for the on/off appearance.
+    struct TruePeakOverIndicator final : public juce::Component, public juce::SettableTooltipClient
+    {
+        TruePeakOverIndicator()
+        {
+            setInterceptsMouseClicks(false, false);
+            setMouseCursor(juce::MouseCursor::NormalCursor);
+            setTooltip("True Peak Over: acende quando a saida pos-limiter ultrapassa o Ceiling. / Lights when the post-limiter true peak exceeds the Ceiling.");
+            setTitle("True Peak Over Indicator");
+            setDescription("Post-limiter true-peak overshoot warning");
+            setAccessible(true);
+        }
+        void setLit(bool shouldBeLit) { if (lit != shouldBeLit) { lit = shouldBeLit; repaint(); } }
+        void paint(juce::Graphics& g) override { NFLookAndFeel::paintTruePeakOverIndicator(g, getLocalBounds().toFloat(), lit); }
+        bool lit = false;
+    };
+    TruePeakOverIndicator truePeakOverIndicator;
 
     std::unique_ptr<SliderAttachment> gainA, ceilingA, releaseA, linkA;
     std::unique_ptr<ButtonAttachment> autoA, tpA, bypassA;

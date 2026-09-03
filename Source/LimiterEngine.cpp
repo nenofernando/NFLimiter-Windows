@@ -56,11 +56,17 @@ void LimiterEngine::prepare(double sampleRate, int maximumBlockSize, int newNumC
     inputGainSmoothed.reset(baseSampleRate, 0.02);
     ceilingSmoothed.reset(baseSampleRate, 0.02);
     stereoLinkSmoothed.reset(baseSampleRate, 0.02);
-    bypassMix.reset(baseSampleRate, 0.006); // base rate — the dry crossfade runs post-downsample
+    truePeakBlend.reset(baseSampleRate, 0.02);
+    // 6ms was too fast: with real program material, active gain reduction removed
+    // almost instantly on toggle produced an audible thump/click on bass-heavy content.
+    // 30ms still reads as an instant A/B switch but is long enough (well over one cycle
+    // even at ~30Hz) to smooth over the wet/dry level jump.
+    bypassMix.reset(baseSampleRate, 0.03); // base rate — the dry crossfade runs post-downsample
     inputGainSmoothed.setCurrentAndTargetValue(1.0f);
     ceilingSmoothed.setCurrentAndTargetValue(0.89125f);
     stereoLinkSmoothed.setCurrentAndTargetValue(1.0f);
     bypassMix.setCurrentAndTargetValue(0.0f);
+    truePeakBlend.setCurrentAndTargetValue(1.0f);
 
     reset();
 }
@@ -98,6 +104,7 @@ void LimiterEngine::switchToPendingFactorIfNeeded()
     inputGainSmoothed.reset(osRate, 0.02);
     ceilingSmoothed.reset(osRate, 0.02);
     stereoLinkSmoothed.reset(osRate, 0.02);
+    truePeakBlend.reset(osRate, 0.02);
     // bypassMix runs at the base rate and is unaffected by the oversampling factor.
 }
 
@@ -106,7 +113,13 @@ void LimiterEngine::setParameters(float inputGainDb, float ceilingDbTP, float re
 {
     inputGainSmoothed.setTargetValue(juce::Decibels::decibelsToGain(inputGainDb));
     ceilingSmoothed.setTargetValue(juce::Decibels::decibelsToGain(ceilingDbTP));
-    stereoLinkSmoothed.setTargetValue(juce::jlimit(0.0f, 1.0f, stereoLinkPercent));
+    // stereoLinkPercent arrives as 0-100 (the "stereo_link" APVTS parameter's own
+    // range, shown to the user as "N %"), but stereoLinkSmoothed is a normalised 0-1
+    // ramp. This was previously clamped instead of divided, which silently collapsed
+    // every non-zero value (1-100) to 1.0 — the knob only ever really moved between
+    // "0%" and "100%", with everything in between behaving identically to 100%.
+    stereoLinkSmoothed.setTargetValue(juce::jlimit(0.0f, 1.0f, stereoLinkPercent / 100.0f));
+    truePeakBlend.setTargetValue(truePeakIn ? 1.0f : 0.0f);
     releaseMs = juce::jlimit(10.0f, 1000.0f, releaseMsIn);
     autoRelease = autoReleaseIn;
     character = characterIn;
@@ -205,6 +218,7 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
         const float gainNow = inputGainSmoothed.getNextValue();
         const float ceilNow = ceilingSmoothed.getNextValue();
         const float linkNow = stereoLinkSmoothed.getNextValue();
+        const float tpBlendNow = truePeakBlend.getNextValue();
 
         float peak[2] { 0.0f, 0.0f };
         for (int ch = 0; ch < chans; ++ch)
@@ -219,17 +233,32 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
 
             const float instantAbs = std::abs(xGained);
             if ((writePos % factor) == 0) cs.heldDigitalPeak = instantAbs;
-            peak[ch] = truePeakEnabled ? instantAbs : cs.heldDigitalPeak;
+            // Blended rather than hard-switched: toggling True Peak mid-playback ramps
+            // between the two detector sources instead of handing the lookahead window
+            // a discontinuous target on a single sample (see truePeakBlend above).
+            peak[ch] = cs.heldDigitalPeak + tpBlendNow * (instantAbs - cs.heldDigitalPeak);
         }
 
-        const float linkedMax = chans > 1 ? juce::jmax(peak[0], peak[1]) : peak[0];
+        // Stereo Link interpolates in the dB gain-reduction domain, not the linear peak
+        // domain: each channel first gets its own fully-independent target, then (for
+        // true stereo material) the two are blended toward whichever needs the larger
+        // reduction. Blending dB values — not peaks — before converting back to a linear
+        // gain is what keeps the link curve perceptually linear across 0-100%, and it's
+        // mono-safe by construction: with one channel there is no second target to blend
+        // toward, so linkNow has no effect at all, matching the pre-link behaviour exactly.
+        float independentGrDb[2] { 0.0f, 0.0f };
+        for (int ch = 0; ch < chans; ++ch)
+        {
+            const float independentTarget = (peak[ch] > ceilNow && peak[ch] > 1.0e-9f) ? ceilNow / peak[ch] : 1.0f;
+            independentGrDb[ch] = juce::Decibels::gainToDecibels(juce::jlimit(0.0f, 1.0f, independentTarget), -100.0f);
+        }
+        const float linkedGrDb = chans > 1 ? juce::jmin(independentGrDb[0], independentGrDb[1]) : independentGrDb[0];
 
         for (int ch = 0; ch < chans; ++ch)
         {
             auto& cs = channelState[(size_t) ch];
-            const float detector = juce::jmap(linkNow, peak[ch], linkedMax);
-            float target = bypassed ? 1.0f
-                                     : (detector > ceilNow && detector > 1.0e-9f ? ceilNow / detector : 1.0f);
+            const float finalGrDb = juce::jmap(linkNow, independentGrDb[ch], linkedGrDb);
+            float target = bypassed ? 1.0f : juce::Decibels::decibelsToGain(finalGrDb, -100.0f);
             target = juce::jlimit(0.0f, 1.0f, target);
             pushMin(cs, writePos, target, minRingCapacity);
         }
@@ -257,7 +286,17 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
 
                 float wet = cs.delay[(size_t) (readPos % delayCapacity)] * cs.currentGain;
                 applyCharacter(wet);
-                wet = juce::jlimit(-ceilNow, ceilNow, wet); // last-resort safety net, not the primary mechanism
+                // Last-resort safety net against decimation-filter ringing overshoot —
+                // only meaningful when the gain computer is actually targeting this same
+                // oversampled ceiling, i.e. True Peak is on. With it off, gain reduction
+                // is deliberately driven by the decimated sample peak alone, so the true
+                // (oversampled) peak is *expected* to run past the ceiling; clamping it
+                // here would silently distort the signal and hide that legitimate
+                // overshoot from both the ear and the meter. Blended by the same ramp as
+                // the detector above (not a hard on/off switch) so toggling the button
+                // fades the clamp in/out instead of stepping the sample value.
+                const float clampedWet = juce::jlimit(-ceilNow, ceilNow, wet);
+                wet += tpBlendNow * (clampedWet - wet);
                 osBlock.getChannelPointer((size_t) ch)[i] = wet;
 
                 minGainThisBlock = juce::jmin(minGainThisBlock, cs.currentGain);
@@ -327,10 +366,12 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
     const float reportedGain = minGainThisBlock + finalMix * (1.0f - minGainThisBlock);
     currentGrDb.store(juce::Decibels::gainToDecibels(reportedGain, -60.0f));
 
-    // The metered peak follows the True Peak toggle, same as the detector: with it on,
-    // report the genuine oversampled (intersample) peak of the wet signal; with it off,
-    // report a plain decimated sample peak — so the toggle visibly changes the reading,
-    // not just an inaudible internal detail. Bypassed always reports the real output.
-    const float reportedPeakLinear = (bypassed || ! truePeakEnabled) ? maxAbsOutThisBlock : juce::jmax(maxAbsWetOS, maxAbsOutThisBlock);
+    // The True Peak meter (and the TRUE PEAK OVER indicator it feeds) always reports the
+    // genuine oversampled/intersample peak, regardless of the True Peak toggle — that
+    // toggle only decides whether this peak is allowed to *drive gain reduction*
+    // ("True Peak Limiting"), never whether it's *measured* ("True Peak Meter"). With it
+    // off, the reconstructed peak can legitimately exceed the ceiling, and OVER must
+    // still be able to light up to say so. Bypassed always reports the real output.
+    const float reportedPeakLinear = bypassed ? maxAbsOutThisBlock : juce::jmax(maxAbsWetOS, maxAbsOutThisBlock);
     currentTruePeakDb.store(juce::Decibels::gainToDecibels(reportedPeakLinear, -100.0f));
 }

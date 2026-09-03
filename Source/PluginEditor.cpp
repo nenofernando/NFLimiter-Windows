@@ -1,6 +1,7 @@
 #include "PluginEditor.h"
 #include "BinaryData.h"
 
+
 // ---------------------------------------------------------------------------------
 // Design-space geometry (1536x1024), measured directly from
 // Assets/Reference/NF_Limiter_approved_concept.png: panel/control rects come verbatim
@@ -20,12 +21,18 @@ namespace NFLayout
     // at the same size as A/B, since the approved crop itself has no SAVE button). MENU
     // sits alone in the far corner with a larger gap, per the reference's spirit of a
     // single settings affordance separate from the preset controls.
-    static const R presetPill      { 965, 27, 215, 62 };
-    static const R aRect           { 1185, 27, 62, 62 };
-    static const R bRect           { 1252, 27, 62, 62 };
-    static const R copyRect        { 1319, 27, 95, 62 };
-    static const R saveRect        { 1422, 27, 62, 62 };
-    static const R menuRect        { 1496, 27, 40, 62 };
+    // Narrower than before and re-centred on the PEAK/TRUE PEAK/LUFS-M/LUFS-I info
+    // column beneath it (peakBox, centred at x=1090) instead of spanning wider than
+    // that column.
+    static const R presetPill      { 995, 27, 190, 62 };
+    static constexpr float presetArrowW = 34.0f;
+    // A/B/COPY/SAVE shrunk to match the narrower preset pill, laid out sequentially
+    // right after it with small consistent gaps; MENU keeps its own larger gap.
+    static const R aRect           { 1201, 33, 50, 50 };
+    static const R bRect           { 1259, 33, 50, 50 };
+    static const R copyRect        { 1317, 33, 78, 50 };
+    static const R saveRect        { 1403, 33, 50, 50 };
+    static const R menuRect        { 1477, 33, 40, 50 };
 
     static const R leftPanel       { 28, 115, 320, 670 };
     static const R rightPanel      { 1188, 115, 320, 670 };
@@ -70,27 +77,46 @@ namespace NFLayout
     static const R lufsIBox        { 1010, 485, 160, 105 };
     static const R clipBox         { 1010, 610, 160, 110 };
 
-    // Bottom control bar.
-    static const R releaseTitle    { 40, 796, 225, 24 };
-    static const R releaseKnob     { 107, 826, 90, 90 };
-    static const R releaseValue    { 40, 918, 225, 22 };
-    static const R autoPill        { 77, 942, 150, 26 };
+    // Bottom control bar, laid out as one grid: every zone's title shares the same
+    // titleBaselineY, every zone's main control shares the same controlCenterY (knobs
+    // and buttons of different heights are centred on this same line rather than
+    // top-aligned), and RELEASE/STEREO LINK's numeric readouts share valueBaselineY.
+    static constexpr float titleBaselineY = 806.0f;
+    static constexpr float controlCenterY = 883.0f;
+    static constexpr float valueBaselineY = 920.0f;
+    static constexpr float secondaryControlCenterY = 955.0f;
+    static constexpr float minimumGroupGap = 12.0f;
 
-    static const R characterTitle  { 275, 806, 355, 24 };
-    static const R characterBox    { 285, 838, 335, 90 };
+    // Shifted right so the RELEASE knob shares the exact same centre X as the GAIN
+    // knob above it (both at design-space x=188) instead of sitting 36px to its left.
+    static const R releaseTitle    { 76, titleBaselineY, 225, 24 };
+    static const R releaseKnob     { 143, controlCenterY - 45.0f, 90, 90 };
+    static const R releaseValue    { 76, valueBaselineY, 225, 22 };
+    static const R autoPill        { 113, secondaryControlCenterY - 13.0f, 150, 26 };
 
-    static const R truePeakTitle   { 625, 806, 155, 24 };
-    static const R truePeakButton  { 647, 845, 110, 58 };
+    // Left edge stays put (minimumGroupGap from RELEASE), width trimmed a bit further
+    // so the gap to TRUE PEAK matches TRUE PEAK's gap to OVERSAMPLING on the other side.
+    static const R characterTitle  { 313, titleBaselineY, 247, 24 };
+    static const R characterBox    { 313, controlCenterY - 45.0f, 247, 90 };
 
-    static const R oversamplingTitle { 775, 806, 320, 24 };
-    static const R oversamplingBox   { 785, 838, 300, 90 };
+    // Centred on the GAIN REDUCTION panel's own centreX (672.5), not on the group's
+    // own arbitrary column position — same axis as the header title and the GR block.
+    // This axis is fixed and must not move for any spacing adjustment.
+    static const R truePeakTitle   { grPanel.getCentreX() - 155.0f * 0.5f, titleBaselineY, 155, 24 };
+    static const R truePeakButton  { grPanel.getCentreX() - 110.0f * 0.5f, controlCenterY - 29.0f, 110, 58 };
 
-    static const R linkTitle       { 1090, 796, 185, 24 };
-    static const R linkKnob        { 1137, 830, 90, 90 };
-    static const R linkValue       { 1090, 928, 185, 26 };
+    static const R oversamplingTitle { 775, titleBaselineY, 320, 24 };
+    static const R oversamplingBox   { 785, controlCenterY - 45.0f, 300, 90 };
 
-    static const R bypassButton    { 1270, 800, 225, 55 };
-    static const R powerButton     { 1270, 868, 225, 58 };
+    // Nudged left ~30px from its original centre for better breathing room before BYPASS/POWER.
+    static const R linkTitle       { 1060, titleBaselineY, 185, 24 };
+    static const R linkKnob        { 1107, controlCenterY - 45.0f, 90, 90 };
+    static const R linkValue       { 1060, valueBaselineY, 185, 26 };
+
+    // Both re-centred on the CEILING knob above them (design x=1348) rather than on
+    // their own original column, per explicit request.
+    static const R powerButton     { ceilingKnob.getCentreX() - 112.5f, 868, 225, 58 };
+    static const R bypassButton    { ceilingKnob.getCentreX() - 65.0f, 808.5f, 130, 38 };
 }
 
 // --------------------------------------------------------------------- ChoiceGroup --
@@ -173,8 +199,8 @@ NFLimiterAudioProcessorEditor::NFLimiterAudioProcessorEditor(NFLimiterAudioProce
     };
 
     std::vector<juce::TextButton*> charBtns, osBtns;
-    for (auto& b : characterButtons) { addAndMakeVisible(b); b.setClickingTogglesState(false); charBtns.push_back(&b); }
-    for (auto& b : oversamplingButtons) { addAndMakeVisible(b); b.setClickingTogglesState(false); osBtns.push_back(&b); }
+    for (auto& b : characterButtons) { addAndMakeVisible(b); b.setClickingTogglesState(false); b.setComponentID("character"); charBtns.push_back(&b); }
+    for (auto& b : oversamplingButtons) { addAndMakeVisible(b); b.setClickingTogglesState(false); b.setComponentID("oversampling"); osBtns.push_back(&b); }
     characterGroup.bind(processor.apvts, "character", charBtns);
     oversamplingGroup.bind(processor.apvts, "oversampling", osBtns);
     characterButtons[0].setTooltip("Clean: bit-transparent, no colouration.");
@@ -192,6 +218,7 @@ NFLimiterAudioProcessorEditor::NFLimiterAudioProcessorEditor(NFLimiterAudioProce
     addAndMakeVisible(bButton);
     addAndMakeVisible(copyButton);
     addAndMakeVisible(resizer);
+    addAndMakeVisible(truePeakOverIndicator);
     presetPrev.setTooltip("Previous preset");
     presetNext.setTooltip("Next preset");
     savePreset.setTooltip("Save current settings as a new user preset");
@@ -244,6 +271,8 @@ juce::Rectangle<int> NFLimiterAudioProcessorEditor::map(juce::Rectangle<float> d
     return designRect.transformedBy(designToScreen()).getSmallestIntegerContainer();
 }
 
+float NFLimiterAudioProcessorEditor::getMainProcessingAxisX() { return NFLayout::grPanel.getCentreX(); }
+
 // ----------------------------------------------------------------------- behaviour --
 
 void NFLimiterAudioProcessorEditor::refreshPresetList()
@@ -281,20 +310,157 @@ void NFLimiterAudioProcessorEditor::requestSavePreset()
     }), true);
 }
 
-void NFLimiterAudioProcessorEditor::showManualDialog(const juce::String& title, const juce::String& text)
+namespace ManualDoc
 {
-    auto editor = std::make_unique<juce::TextEditor>();
-    editor->setMultiLine(true, true);
-    editor->setReadOnly(true);
-    editor->setCaretVisible(false);
-    editor->setColour(juce::TextEditor::backgroundColourId, juce::Colour(0xff0c0f16));
-    editor->setColour(juce::TextEditor::textColourId, juce::Colours::white);
-    editor->setFont(juce::Font(juce::FontOptions(14.0f)));
-    editor->setText(text);
-    editor->setSize(680, 520);
+    struct Block
+    {
+        enum Kind { Heading, Paragraph, Bullet, Image } kind;
+        juce::String text;
+        juce::Image image;
+    };
+
+    // A single scrollable page mixing wrapped, wordwrapped text blocks with the two
+    // real UI screenshots (Assets/Manual/overview.png, controls.png), laid out top to
+    // bottom at a fixed content width. No markdown parsing at runtime: the manual's
+    // structure is built directly in buildManualBlocks() below, in each language.
+    struct Page final : public juce::Component
+    {
+        static constexpr int contentWidth = 620;
+        static constexpr int margin = 20;
+        std::vector<Block> blocks;
+
+        int layout(juce::Graphics* g)
+        {
+            int y = margin;
+            for (auto& b : blocks)
+            {
+                if (b.kind == Block::Image)
+                {
+                    const float scale = (float) contentWidth / (float) juce::jmax(1, b.image.getWidth());
+                    const int h = (int) std::round(b.image.getHeight() * scale);
+                    if (g != nullptr)
+                    {
+                        g->setColour(juce::Colour(0xff2a2f38));
+                        g->drawRect(juce::Rectangle<int>(margin, y, contentWidth, h).toFloat().expanded(1.0f), 1.0f);
+                        g->drawImage(b.image, (float) margin, (float) y, (float) contentWidth, (float) h,
+                                     0, 0, b.image.getWidth(), b.image.getHeight());
+                    }
+                    y += h + 22;
+                    continue;
+                }
+
+                const bool bullet = b.kind == Block::Bullet;
+                const float indent = bullet ? 18.0f : 0.0f;
+                juce::AttributedString as;
+                as.setWordWrap(juce::AttributedString::byWord);
+                as.setLineSpacing(4.0f);
+                if (b.kind == Block::Heading)
+                {
+                    as.append(b.text, juce::Font(juce::FontOptions(19.0f, juce::Font::bold)), juce::Colour(0xff5ec8ff));
+                }
+                else
+                {
+                    if (bullet) as.append(juce::String::fromUTF8("\xE2\x80\xA2  "),
+                                           juce::Font(juce::FontOptions(14.5f)), juce::Colours::white.withAlpha(0.6f));
+                    as.append(b.text, juce::Font(juce::FontOptions(14.5f)), juce::Colours::white.withAlpha(0.88f));
+                }
+                juce::TextLayout tl;
+                tl.createLayout(as, (float) contentWidth - indent);
+                if (g != nullptr) tl.draw(*g, juce::Rectangle<float>((float) margin + indent, (float) y,
+                                                                      (float) contentWidth - indent, tl.getHeight()));
+                y += (int) std::ceil(tl.getHeight()) + (b.kind == Block::Heading ? 10 : 12);
+            }
+            return y + margin;
+        }
+
+        void resized() override {}
+        void paint(juce::Graphics& g) override
+        {
+            g.fillAll(juce::Colour(0xff0c0f16));
+            layout(&g);
+        }
+
+        void finalise()
+        {
+            setSize(contentWidth + margin * 2, layout(nullptr));
+        }
+    };
+
+    static std::unique_ptr<Page> buildManualPage(bool portuguese)
+    {
+        auto overview = juce::ImageCache::getFromMemory(BinaryData::overview_png, BinaryData::overview_pngSize);
+        auto controls = juce::ImageCache::getFromMemory(BinaryData::controls_png, BinaryData::controls_pngSize);
+
+        auto page = std::make_unique<Page>();
+        auto& bl = page->blocks;
+        auto H = [&] (const char* t) { bl.push_back({ Block::Heading, juce::String::fromUTF8(t), {} }); };
+        auto P = [&] (const char* t) { bl.push_back({ Block::Paragraph, juce::String::fromUTF8(t), {} }); };
+        auto B = [&] (const char* t) { bl.push_back({ Block::Bullet, juce::String::fromUTF8(t), {} }); };
+        auto I = [&] (juce::Image img) { bl.push_back({ Block::Image, {}, img }); };
+
+        if (portuguese)
+        {
+            H("NF Limiter V1.0 — Manual");
+            P("NF Audio Tools — By Nenno Fernando. Limitador de masterizacao com true peak sobreamostrado, medicao de loudness BS.1770 (LUFS-M/LUFS-I) e lookahead sem overshoot.");
+            H("Visao geral da interface");
+            I(overview);
+            P("Da esquerda para a direita: medidores de Input, o painel central GAIN REDUCTION (com historico dos ultimos segundos), as leituras de Peak / True Peak / LUFS-M / LUFS-I e os medidores de Output. A barra superior traz o seletor de presets, A/B, COPY, SAVE e o menu de tres tracos.");
+            H("Fluxo rapido");
+            B("Insira o NF Limiter no ultimo slot do master.");
+            B("Mantenha True Peak ligado e Ceiling em -1,0 dBTP para streaming como ponto inicial.");
+            B("Aumente Gain observando o medidor central de Gain Reduction.");
+            B("Escolha Clean para transparencia, Punch para preservar ataques ou Loud para maior densidade.");
+            B("Compare sempre com Bypass em volume semelhante, para nao confundir volume com melhora real.");
+            H("Controles inferiores");
+            I(controls);
+            P("RELEASE define a velocidade de recuperacao da reducao de ganho; AUTO adapta essa velocidade a intensidade e duracao dos picos. CHARACTER escolhe o comportamento do limitador: Clean (menor coloracao), Punch (recuperacao mais rapida, preserva impacto) ou Loud (maior densidade, saturacao suave controlada). TRUE PEAK protege picos reconstruidos entre amostras (intersample). OVERSAMPLING aumenta a precisao do true peak trocando por mais uso de CPU (1x/2x/4x/8x). STEREO LINK em 100% mantem a imagem estereo estavel; valores menores permitem acao parcialmente independente entre os canais. BYPASS compara o sinal processado com o original, preservando a mesma cadeia de audio (sem clique, com latencia compensada).");
+            H("Medidores");
+            P("INPUT e OUTPUT mostram os canais L/R em tempo real. GAIN REDUCTION mostra a atenuacao aplicada agora e seu historico recente. PEAK e TRUE PEAK exibem os valores maximos ja atingidos. LUFS-M indica o loudness momentaneo; LUFS-I acumula desde a abertura do plugin ou o ultimo reset (menu -> Reset LUFS). TRUE PEAK OVER e um indicador passivo (nao e um botao): acende brevemente sempre que a saida pos-limiter ultrapassa o Ceiling em mais de 0,05 dB.");
+            H("Presets e menu");
+            P("Escolha um preset na barra superior; use A/B para comparar duas configuracoes e COPY para copiar o estado atual entre elas. Clique SAVE para nomear e salvar um preset. O menu de tres tracos abre os manuais em PT/EN, a pasta de presets, About, Reset Window Size e Reset LUFS. A alca no canto inferior direito redimensiona a janela; clicar no logo NF volta ao tamanho padrao.");
+            H("Suporte");
+            P("NF Audio Tools — By Nenno Fernando. Versao 1.0.");
+        }
+        else
+        {
+            H("NF Limiter V1.0 — Manual");
+            P("NF Audio Tools — By Nenno Fernando. A true-peak, oversampled, lookahead mastering limiter with BS.1770 loudness metering (LUFS-M/LUFS-I) and zero-overshoot brickwall limiting.");
+            H("Interface overview");
+            I(overview);
+            P("Left to right: Input meters, the central GAIN REDUCTION panel (with a rolling history of the last few seconds), the Peak / True Peak / LUFS-M / LUFS-I readouts, and the Output meters. The top bar holds the preset selector, A/B, COPY, SAVE and the three-line menu.");
+            H("Quick workflow");
+            B("Insert NF Limiter in the last slot of the master bus.");
+            B("Keep True Peak on and start with Ceiling at -1.0 dBTP for streaming.");
+            B("Raise Gain while watching the central Gain Reduction meter.");
+            B("Choose Clean for transparency, Punch to preserve transients, or Loud for extra density.");
+            B("Always compare against Bypass at a matched perceived level, so you're judging quality, not just loudness.");
+            H("Bottom controls");
+            I(controls);
+            P("RELEASE sets how fast gain reduction recovers; AUTO adapts that speed to the intensity and duration of the peaks. CHARACTER picks the limiter's behaviour: Clean (least colouration), Punch (faster recovery, preserves impact) or Loud (denser, gently saturated). TRUE PEAK protects reconstructed inter-sample peaks. OVERSAMPLING trades CPU for true-peak accuracy (1x/2x/4x/8x). STEREO LINK at 100% keeps the stereo image stable; lower values let the channels act more independently. BYPASS compares the processed signal against the original through the same audio chain, click-free and latency-compensated.");
+            H("Meters");
+            P("INPUT and OUTPUT show the L/R channels in real time. GAIN REDUCTION shows the attenuation applied right now plus its recent history. PEAK and TRUE PEAK show the highest values reached. LUFS-M is momentary loudness; LUFS-I accumulates since the plugin opened or the last reset (menu -> Reset LUFS). TRUE PEAK OVER is a passive indicator (never a button): it lights briefly whenever the post-limiter output exceeds the Ceiling by more than 0.05 dB.");
+            H("Presets and menu");
+            P("Pick a preset from the top bar; use A/B to compare two settings and COPY to copy the current state between them. Click SAVE to name and store a preset. The three-line menu opens the PT/EN manuals, the presets folder, About, Reset Window Size and Reset LUFS. Drag the lower-right handle to resize the window; click the NF logo to restore the default size.");
+            H("Support");
+            P("NF Audio Tools — By Nenno Fernando. Version 1.0.");
+        }
+
+        page->finalise();
+        return page;
+    }
+}
+
+void NFLimiterAudioProcessorEditor::showManualDialog(const juce::String& title, bool portuguese)
+{
+    auto page = ManualDoc::buildManualPage(portuguese);
+
+    auto viewport = std::make_unique<juce::Viewport>();
+    viewport->setViewedComponent(page.release(), true);
+    viewport->setSize(720, 640);
+    viewport->setScrollBarsShown(true, false);
 
     juce::DialogWindow::LaunchOptions o;
-    o.content.setOwned(editor.release());
+    o.content.setOwned(viewport.release());
     o.dialogTitle = title;
     o.dialogBackgroundColour = juce::Colour(0xff0c0f16);
     o.escapeKeyTriggersCloseButton = true;
@@ -317,10 +483,8 @@ void NFLimiterAudioProcessorEditor::showMainMenu()
     m.addItem(6, "About");
     m.showMenuAsync({}, [this](int r)
     {
-        if (r == 1) showManualDialog("Manual - Portugues",
-            juce::String::fromUTF8(BinaryData::MANUAL_PT_md, BinaryData::MANUAL_PT_mdSize));
-        else if (r == 2) showManualDialog("Manual - English",
-            juce::String::fromUTF8(BinaryData::MANUAL_EN_md, BinaryData::MANUAL_EN_mdSize));
+        if (r == 1) showManualDialog("Manual - Portugues", true);
+        else if (r == 2) showManualDialog("Manual - English", false);
         else if (r == 3)
         {
             auto folder = processor.presets.folder();
@@ -345,6 +509,7 @@ void NFLimiterAudioProcessorEditor::timerCallback()
     characterGroup.refresh();
     oversamplingGroup.refresh();
     power.setToggleState(! bypass.getToggleState(), juce::dontSendNotification);
+    truePeakOverIndicator.setLit(snapshot.clip);
     repaint();
 }
 
@@ -648,6 +813,7 @@ void NFLimiterAudioProcessorEditor::drawPill(juce::Graphics& g, juce::Rectangle<
 void NFLimiterAudioProcessorEditor::paint(juce::Graphics& g)
 {
     using namespace NFLayout;
+    juce::ignoreUnused(minimumGroupGap); // documents the >=12px gap the constants above were spaced by
     g.fillAll(NFColour::graphite);
 
     juce::Graphics::ScopedSaveState save(g);
@@ -700,7 +866,7 @@ void NFLimiterAudioProcessorEditor::paint(juce::Graphics& g)
 
        #if NF_DEBUG_GR_CENTER_GUIDES
         g.setColour(juce::Colours::red);
-        g.drawLine(titleCenterX, 4.0f, titleCenterX, (float) (NFLayout::grPanel.getBottom()), 1.0f);
+        g.drawLine(titleCenterX, 4.0f, titleCenterX, (float) (NFLayout::truePeakButton.getBottom() + 4.0f), 1.0f);
        #endif
     }
 
@@ -748,21 +914,6 @@ void NFLimiterAudioProcessorEditor::paint(juce::Graphics& g)
 
     g.setColour(juce::Colours::white.withAlpha(0.15f));
     g.drawLine(clipBox.getX() + 10.0f, clipBox.getY(), clipBox.getRight() - 10.0f, clipBox.getY(), 1.0f);
-    auto clipArea = clipBox.withTrimmedTop(10.0f);
-    g.setColour(NFColour::grRed);
-    g.setFont(juce::Font(juce::FontOptions(15.0f, juce::Font::bold)).withExtraKerningFactor(0.08f));
-    g.drawText("CLIP", clipArea.removeFromTop(clipArea.getHeight() * 0.42f), juce::Justification::centred);
-    juce::Rectangle<float> led(26.0f, 26.0f);
-    led.setCentre(clipArea.getCentreX(), clipArea.getY() + 22.0f);
-    g.setColour(snapshot.clip ? NFColour::grRed : NFColour::grRed.withAlpha(0.25f));
-    g.fillEllipse(led);
-    if (snapshot.clip)
-    {
-        g.setColour(NFColour::grRed.withAlpha(0.35f));
-        g.fillEllipse(led.expanded(8.0f));
-    }
-    g.setColour(juce::Colours::black.withAlpha(0.6f));
-    g.drawEllipse(led, 1.0f);
 
     drawGroupBox(g, characterBox);
     drawGroupBox(g, oversamplingBox);
@@ -781,9 +932,18 @@ void NFLimiterAudioProcessorEditor::paint(juce::Graphics& g)
     g.drawText(juce::String(juce::roundToInt(processor.apvts.getRawParameterValue("stereo_link")->load())) + " %",
                linkValue, juce::Justification::centred);
 
-    g.setColour(juce::Colours::white.withAlpha(0.82f));
-    g.setFont(juce::Font(juce::FontOptions(14.5f)).withExtraKerningFactor(0.18f));
-    g.drawText(juce::String::fromUTF8("NF AUDIO TOOLS \xE2\x80\x94 BY NENNO FERNANDO"), footerRect, juce::Justification::centred);
+   #if NF_DEBUG_GR_CENTER_GUIDES
+    g.setColour(juce::Colours::lime);
+    g.drawLine(28.0f, titleBaselineY, 1508.0f, titleBaselineY, 1.0f);
+    g.setColour(juce::Colours::cyan);
+    g.drawLine(28.0f, controlCenterY, 1508.0f, controlCenterY, 1.0f);
+    g.setColour(juce::Colours::yellow);
+    g.drawLine(28.0f, valueBaselineY, 1508.0f, valueBaselineY, 1.0f);
+   #endif
+
+    g.setColour(juce::Colours::white.withAlpha(0.35f));
+    g.setFont(juce::Font(juce::FontOptions(11.0f)));
+    g.drawText("v1.0", footerRect.reduced(14.0f, 0.0f), juce::Justification::centredRight);
 }
 
 // ---------------------------------------------------------------------- resized --
@@ -792,9 +952,9 @@ void NFLimiterAudioProcessorEditor::resized()
 {
     using namespace NFLayout;
 
-    presetPrev.setBounds(map({ presetPill.getX(), presetPill.getY(), presetPill.getHeight(), presetPill.getHeight() }));
-    presetNext.setBounds(map({ presetPill.getRight() - presetPill.getHeight(), presetPill.getY(), presetPill.getHeight(), presetPill.getHeight() }));
-    presets.setBounds(map(presetPill.reduced(presetPill.getHeight() * 0.9f, 0.0f)));
+    presetPrev.setBounds(map({ presetPill.getX(), presetPill.getY(), presetArrowW, presetPill.getHeight() }));
+    presetNext.setBounds(map({ presetPill.getRight() - presetArrowW, presetPill.getY(), presetArrowW, presetPill.getHeight() }));
+    presets.setBounds(map(presetPill.reduced(presetArrowW, 0.0f)));
     aButton.setBounds(map(aRect));
     bButton.setBounds(map(bRect));
     copyButton.setBounds(map(copyRect));
@@ -810,6 +970,7 @@ void NFLimiterAudioProcessorEditor::resized()
     truePeak.setBounds(map(truePeakButton));
     bypass.setBounds(map(bypassButton));
     power.setBounds(map(powerButton));
+    truePeakOverIndicator.setBounds(map(clipBox.withTrimmedTop(10.0f)));
 
     {
         auto box = characterBox;

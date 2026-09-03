@@ -111,6 +111,14 @@ void NFLimiterAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
     const float releaseCoeff = std::exp(-bucketMs / juce::jmax(1.0f, releaseMsParam));
 
     float blockMinGrDb = 0.0f;
+    // limiter.truePeakDb() is a snapshot overwritten on every process() call — with the
+    // host block sliced into several ~5-8ms sub-chunks below, reading it only once
+    // *after* the loop would silently report only the *last* sub-chunk's true peak,
+    // dropping a genuinely higher peak that happened earlier in the same host block
+    // (the exact bug behind PEAK reading higher than TRUE PEAK: PEAK is computed once
+    // below over the *whole* buffer, so it never had this blind spot). Track the block-
+    // wide max explicitly so both meters are measured over the same window.
+    float blockMaxTruePeakDb = -100.0f;
     int pos = 0;
     const int totalSamples = buffer.getNumSamples();
     while (pos < totalSamples)
@@ -118,6 +126,7 @@ void NFLimiterAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
         const int chunk = juce::jmin(historyChunkSamples, totalSamples - pos);
         juce::AudioBuffer<float> sub(buffer.getArrayOfWritePointers(), buffer.getNumChannels(), pos, chunk);
         limiter.process(sub);
+        blockMaxTruePeakDb = juce::jmax(blockMaxTruePeakDb, limiter.truePeakDb());
 
         // bucketGrDb: the real minimum (deepest) gain reduction the limiter applied
         // anywhere in this ~8ms bucket — never the input Gain, never input/output
@@ -140,7 +149,7 @@ void NFLimiterAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
         pos += chunk;
     }
 
-    metering.captureOutput(buffer, blockMinGrDb, limiter.truePeakDb(), raw("ceiling"), bypassedNow);
+    metering.captureOutput(buffer, blockMinGrDb, blockMaxTruePeakDb, raw("ceiling"), bypassedNow);
 }
 
 void NFLimiterAudioProcessor::parameterChanged(const juce::String& parameterID, float)

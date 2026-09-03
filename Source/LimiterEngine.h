@@ -100,6 +100,11 @@ private:
     // base sample rate, applied after downsampling) so toggling Bypass crossfades
     // instead of switching paths on a single sample.
     juce::SmoothedValue<float> bypassMix;
+    // 0 = gain driven by the held sample-grid peak (True Peak off), 1 = by the genuine
+    // instantaneous oversampled peak (True Peak on). Ramped (at the oversampled rate)
+    // so flipping the button blends smoothly between the two detector sources instead
+    // of handing the lookahead window a discontinuous target on a single sample.
+    juce::SmoothedValue<float> truePeakBlend;
     float releaseMs = 150.0f;
     bool autoRelease = true;
     bool truePeakEnabled = true;

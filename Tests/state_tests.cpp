@@ -155,6 +155,51 @@ int main()
         check(true, label2); // documents the configured bucket size alongside the measured spread above
     }
 
+    std::printf("\n-- PEAK vs TRUE PEAK coherence across a large host block --\n");
+    {
+        // Reproduces the exact bug: processBlock slices a large host block into several
+        // ~5ms sub-chunks internally, and metering.captureOutput() must see the block-
+        // WIDE max true peak, not just whichever sub-chunk happened to run last. Feed a
+        // single large host block (2048 samples, far bigger than one 5ms sub-chunk) with
+        // its loudest, most intersample-peak-provoking content in the FIRST sub-chunk and
+        // near-silence afterwards — if the bug were still present, the last sub-chunk's
+        // near-zero true peak would overwrite the real one before metering ever saw it.
+        const double sr = 48000.0;
+        NFLimiterAudioProcessor p;
+        p.prepareToPlay(sr, 2048);
+        set(p, "gain", p.apvts.getParameter("gain")->convertTo0to1(0.0f));
+        set(p, "ceiling", p.apvts.getParameter("ceiling")->convertTo0to1(-1.0f));
+        set(p, "true_peak", 0.0f); // OFF: sample-peak-only limiting deliberately lets true peak run past ceiling
+
+        juce::AudioBuffer<float> buf(2, 2048);
+        buf.clear();
+        const double f1 = sr * 0.30, f2 = sr * 0.32;
+        for (int ch = 0; ch < 2; ++ch)
+            for (int i = 0; i < 200; ++i) // only the first ~4ms carries the hot intersample-peak content
+            {
+                const double t = (double) i / sr;
+                float x = 0.5f * (float) (std::sin(2.0 * juce::MathConstants<double>::pi * f1 * t)
+                                         + std::sin(2.0 * juce::MathConstants<double>::pi * f2 * t));
+                buf.setSample(ch, i, juce::jlimit(-1.0f, 1.0f, x * 1.98f));
+            }
+
+        // Process the hot block itself and read the meter right after it — the lookahead
+        // latency (a few hundred samples) is far smaller than this 2048-sample block, so
+        // the hot content's emission (and thus its true peak) lands within this same
+        // call. Reading the meter after *later* blocks would just see whatever those
+        // later (silent) blocks measured instead — each processBlock() call reports its
+        // own block's true peak, not a running historical max.
+        juce::MidiBuffer midi;
+        p.processBlock(buf, midi);
+
+        const float measuredTruePeak = p.metering.get().truePeak;
+        char label[220];
+        std::snprintf(label, sizeof(label),
+            "True Peak measured from a large multi-sub-chunk block = %.3f dBTP (must reflect the hot first sub-chunk, not near-silence)",
+            (double) measuredTruePeak);
+        check(measuredTruePeak > -6.0f, label); // the hot content peaks well above -1dBTP ceiling; near-silence would read near -100dB
+    }
+
     std::printf("\n== %d failure(s) ==\n", failures);
     return failures == 0 ? 0 : 1;
 }

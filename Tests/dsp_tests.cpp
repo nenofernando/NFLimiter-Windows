@@ -258,7 +258,7 @@ namespace
     {
         const double sr = 48000.0;
         const int n = (int) sr;
-        const int latencyToSkip = 600; // generous margin over any factor's lookahead+filter latency
+        const int latencyToSkip = 2000; // generous margin over lookahead+filter latency AND the 30ms bypass ramp
 
         auto renderWithGain = [&](float gainDb)
         {
@@ -304,10 +304,11 @@ namespace
             auto signal = makeSine(2, n, sr, 440.0, amplitude);
             auto out = runThroughInBlocks(engine, signal, { 512 });
             const int latency = engine.latencySamples();
+            const int rampSkip = 2000; // let the 30ms bypass ramp fully settle to mix=1 first
 
             float maxAbsDiff = 0.0f;
             for (int ch = 0; ch < 2; ++ch)
-                for (int i = 0; i < n - latency - 8; ++i)
+                for (int i = rampSkip; i < n - latency - 8; ++i)
                     maxAbsDiff = juce::jmax(maxAbsDiff, std::abs(out.getSample(ch, i + latency) - signal.getSample(ch, i)));
 
             const float diffDb = juce::Decibels::gainToDecibels(maxAbsDiff / amplitude);
@@ -465,6 +466,322 @@ namespace
         check(rmsLink0 > 0.32f, l1); // ideal unaffected RMS is 0.5/sqrt(2)=0.3536; link=0 leaves it essentially untouched
         check(rmsLink100 < rmsLink0 * 0.95f, l2); // measurable ducking once linked to left's impulses
         check(rmsLink100 <= rmsLink50 + 1.0e-4f && rmsLink50 <= rmsLink0 + 1.0e-4f, l3); // monotonic in between
+
+        // Full 0/25/50/75/100 sweep, numerically reported as dB of induced ducking on
+        // the otherwise-untouched right channel relative to Link=0%'s own RMS.
+        const float rmsLink25 = render(25.0f);
+        const float rmsLink75 = render(75.0f);
+        auto duckDb = [&](float rms) { return juce::Decibels::gainToDecibels(rms / rmsLink0); };
+        char l4[220];
+        std::snprintf(l4, sizeof(l4),
+            "Right-channel ducking vs Link=0%%: 0%%=%.2fdB 25%%=%.2fdB 50%%=%.2fdB 75%%=%.2fdB 100%%=%.2fdB",
+            (double) duckDb(rmsLink0), (double) duckDb(rmsLink25), (double) duckDb(rmsLink50),
+            (double) duckDb(rmsLink75), (double) duckDb(rmsLink100));
+        check(rmsLink0 >= rmsLink25 - 1.0e-4f && rmsLink25 >= rmsLink50 - 1.0e-4f
+              && rmsLink50 >= rmsLink75 - 1.0e-4f && rmsLink75 >= rmsLink100 - 1.0e-4f, l4);
+    }
+
+    // Per-channel independence proof: L and R each get their own impulse train, offset
+    // in time so neither channel's own transient coincides with the other's. At Link=0%
+    // each channel's dip must appear only at its own impulse times (the other channel's
+    // impulses must not visibly duck it). At Link=100% BOTH channels must show a dip at
+    // BOTH sets of impulse times — i.e. they are now driven by one shared reduction
+    // curve — which is the direct, numeric proof of "L and R receive the same curve."
+    void runStereoLinkPerChannelCurveCheck()
+    {
+        const double sr = 48000.0;
+        // L's impulse sits a full second in (well clear of the engine's own startup
+        // silence while the lookahead window first fills), R's half a second after
+        // that — comfortably more than enough for a 150ms release to fully settle in
+        // between, so neither the startup transient nor a previous-cycle release tail
+        // can contaminate either measurement.
+        const int n = (int) sr * 2;
+        const int lStart = (int) sr;
+        const int offset = (int) sr / 2; // R's impulse sits this far after L's
+
+        auto render = [&](float linkPercent)
+        {
+            LimiterEngine engine;
+            engine.prepare(sr, 512, 2);
+            engine.setParameters(0.0f, -1.0f, 150.0f, false, LimiterEngine::Character::clean, linkPercent, true, false);
+            juce::AudioBuffer<float> in(2, n);
+            in.clear();
+            in.setSample(0, lStart, 3.0f);
+            in.setSample(1, lStart + offset, 3.0f);
+            // A steady sub-ceiling sine underneath the impulses on both channels, so we
+            // have something continuous whose level we can sample to read the gain
+            // curve between impulses (the impulses themselves are far too short/lookahead
+            // -smeared to read a level from directly).
+            auto bed = makeSine(2, n, sr, 300.0, 0.2f);
+            in.addFrom(0, 0, bed, 0, 0, n);
+            in.addFrom(1, 0, bed, 0, 0, n);
+            return runThroughInBlocks(engine, in, { 512 });
+        };
+
+        auto rmsNear = [&](const juce::AudioBuffer<float>& out, int ch, int centreSample, int latency)
+        {
+            const int c = centreSample + latency;
+            double sumSq = 0.0; int count = 0;
+            for (int i = juce::jmax(0, c - 200); i < juce::jmin(out.getNumSamples(), c + 200); ++i)
+            { const float v = out.getSample(ch, i); sumSq += (double) v * v; ++count; }
+            return (float) std::sqrt(sumSq / juce::jmax(1, count));
+        };
+
+        {
+            LimiterEngine probe; probe.prepare(sr, 512, 2);
+            const int latency = probe.latencySamples();
+            auto out0 = render(0.0f);
+            auto out100 = render(100.0f);
+
+            const int rTime = lStart + offset;
+
+            // At the R-only impulse time: R must dip either way (it's R's own transient),
+            // but L must dip only when linked.
+            const float lAtROnlyTime_link0 = rmsNear(out0, 0, rTime, latency);
+            const float lAtROnlyTime_link100 = rmsNear(out100, 0, rTime, latency);
+            const float lAtOwnTime_link0 = rmsNear(out0, 0, lStart, latency);
+
+            char m1[220];
+            std::snprintf(m1, sizeof(m1),
+                "L level at R's impulse instant: Link=0%% %.4f (untouched, ~=L's own baseline %.4f) vs Link=100%% %.4f (ducked)",
+                (double) lAtROnlyTime_link0, (double) lAtOwnTime_link0, (double) lAtROnlyTime_link100);
+            check(lAtROnlyTime_link0 > lAtROnlyTime_link100 * 1.2f, m1);
+
+            const float rAtLOnlyTime_link0 = rmsNear(out0, 1, lStart, latency);
+            const float rAtLOnlyTime_link100 = rmsNear(out100, 1, lStart, latency);
+            const float rAtOwnTime_link0 = rmsNear(out0, 1, rTime, latency);
+            char m2[220];
+            std::snprintf(m2, sizeof(m2),
+                "R level at L's impulse instant: Link=0%% %.4f (untouched, ~=R's own baseline %.4f) vs Link=100%% %.4f (ducked)",
+                (double) rAtLOnlyTime_link0, (double) rAtOwnTime_link0, (double) rAtLOnlyTime_link100);
+            check(rAtLOnlyTime_link0 > rAtLOnlyTime_link100 * 1.2f, m2);
+        }
+    }
+
+    // Mono: with a single channel there is no second channel to blend toward, so the
+    // Stereo Link parameter must be a complete no-op — bit-identical output at 0/50/100%.
+    void runStereoLinkMonoNoOpCheck()
+    {
+        const double sr = 48000.0;
+        const int n = (int) sr;
+        auto render = [&](float linkPercent)
+        {
+            LimiterEngine engine;
+            engine.prepare(sr, 512, 1);
+            engine.setParameters(6.0f, -1.0f, 150.0f, true, LimiterEngine::Character::punch, linkPercent, true, false);
+            auto sig = makeIntersamplePeakSignal(1, n, sr);
+            return runThroughInBlocks(engine, sig, { 512 });
+        };
+        auto out0 = render(0.0f);
+        auto out50 = render(50.0f);
+        auto out100 = render(100.0f);
+        float maxDiff = 0.0f;
+        for (int i = 0; i < n; ++i)
+        {
+            maxDiff = juce::jmax(maxDiff, std::abs(out0.getSample(0, i) - out50.getSample(0, i)));
+            maxDiff = juce::jmax(maxDiff, std::abs(out0.getSample(0, i) - out100.getSample(0, i)));
+        }
+        char label[160];
+        std::snprintf(label, sizeof(label), "Mono: Stereo Link 0/50/100%% produce identical output (max diff = %.8f)", (double) maxDiff);
+        check(maxDiff < 1.0e-6f, label);
+    }
+
+    // Bypass: Stereo Link must have zero effect while bypassed (bit-exact pass-through
+    // regardless of link amount, same guarantee as the existing bypass null test).
+    void runStereoLinkBypassNoOpCheck()
+    {
+        const double sr = 48000.0;
+        const int n = (int) sr;
+        auto render = [&](float linkPercent)
+        {
+            LimiterEngine engine;
+            engine.prepare(sr, 512, 2);
+            engine.setParameters(12.0f, -1.0f, 150.0f, true, LimiterEngine::Character::loud, linkPercent, true, true);
+            auto left = makeImpulses(1, n, 4800, 3.0f);
+            auto right = makeSine(1, n, sr, 300.0, 0.5f);
+            juce::AudioBuffer<float> in(2, n);
+            in.copyFrom(0, 0, left, 0, 0, n);
+            in.copyFrom(1, 0, right, 0, 0, n);
+            return runThroughInBlocks(engine, in, { 512 });
+        };
+        auto out0 = render(0.0f);
+        auto out100 = render(100.0f);
+        float maxDiff = 0.0f;
+        for (int ch = 0; ch < 2; ++ch)
+            for (int i = 2000; i < n; ++i)
+                maxDiff = juce::jmax(maxDiff, std::abs(out0.getSample(ch, i) - out100.getSample(ch, i)));
+        char label[160];
+        std::snprintf(label, sizeof(label), "Bypass: Stereo Link 0%% vs 100%% produce identical output (max diff = %.8f)", (double) maxDiff);
+        check(maxDiff < 1.0e-6f, label);
+    }
+
+    // ------------------------------------------------------------------------------
+    // TRUE PEAK audit: the button must change the limiting algorithm itself (which
+    // peak value drives gain reduction), not just a label. The meter and TRUE PEAK
+    // OVER indicator must keep reporting the real reconstructed peak regardless of
+    // the toggle — "True Peak Limiting" off is not "True Peak Meter" off.
+    // ------------------------------------------------------------------------------
+
+    // Teste A / Teste B from the audit spec, on the same intersample-peak-rich signal,
+    // same Gain, same Ceiling: only the True Peak toggle differs.
+    void runTruePeakAlgorithmAudit()
+    {
+        const double sr = 48000.0;
+        const int n = (int) sr;
+        const float ceilingDbTP = -1.0f;
+        const float ceilingLin = juce::Decibels::decibelsToGain(ceilingDbTP);
+
+        auto render = [&](bool truePeakOn)
+        {
+            LimiterEngine engine;
+            engine.prepare(sr, 512, 2);
+            engine.setParameters(0.0f, ceilingDbTP, 150.0f, true, LimiterEngine::Character::clean, 100.0f, truePeakOn, false);
+            auto sig = makeIntersamplePeakSignal(2, n, sr);
+            juce::AudioBuffer<float> out(sig);
+            int pos = 0;
+            float maxSamplePeak = 0.0f, maxTruePeakDb = -100.0f;
+            while (pos < n)
+            {
+                const int bs = juce::jmin(512, n - pos);
+                juce::AudioBuffer<float> chunk(out.getArrayOfWritePointers(), 2, pos, bs);
+                engine.process(chunk);
+                for (int ch = 0; ch < 2; ++ch)
+                    for (int i = 0; i < bs; ++i)
+                        maxSamplePeak = juce::jmax(maxSamplePeak, std::abs(chunk.getSample(ch, i)));
+                maxTruePeakDb = juce::jmax(maxTruePeakDb, engine.truePeakDb());
+                pos += bs;
+            }
+            return std::make_tuple(maxSamplePeak, maxTruePeakDb, engine.latencySamples());
+        };
+
+        const auto [sampleOff, trueOff, latOff] = render(false);
+        const auto [sampleOn, trueOn, latOn] = render(true);
+
+        const float sampleOffDb = juce::Decibels::gainToDecibels(sampleOff);
+        const float sampleOnDb = juce::Decibels::gainToDecibels(sampleOn);
+
+        std::printf("  Teste A (TRUE PEAK OFF): max sample peak = %.3f dBFS, max true peak = %.3f dBTP, latency = %d samples\n",
+                    (double) sampleOffDb, (double) trueOff, latOff);
+        std::printf("  Teste B (TRUE PEAK ON):  max sample peak = %.3f dBFS, max true peak = %.3f dBTP, latency = %d samples\n",
+                    (double) sampleOnDb, (double) trueOn, latOn);
+
+        char l1[192], l2[192], l3[192], l4[192], l5[192];
+        std::snprintf(l1, sizeof(l1), "OFF: sample peak held at ceiling (%.3f dBFS <= %.2f dBTP + 0.05)", (double) sampleOffDb, (double) ceilingDbTP);
+        check(sampleOffDb <= ceilingDbTP + 0.05f, l1);
+        std::snprintf(l2, sizeof(l2), "OFF: true peak allowed to exceed ceiling (measured %.3f dBTP > %.2f dBTP)", (double) trueOff, (double) ceilingDbTP);
+        check(trueOff > ceilingDbTP + 0.1f, l2); // this signal is a known intersample-peak provocateur; OFF must let it through
+        std::snprintf(l3, sizeof(l3), "ON: true peak held at ceiling (%.3f dBTP <= %.2f dBTP + 0.05)", (double) trueOn, (double) ceilingDbTP);
+        check(trueOn <= ceilingDbTP + 0.05f, l3);
+        std::snprintf(l4, sizeof(l4), "ON: sample peak also <= ceiling (%.3f dBFS) — limiting the true peak necessarily limits the sample peak too", (double) sampleOnDb);
+        check(sampleOnDb <= ceilingDbTP + 0.05f, l4);
+        std::snprintf(l5, sizeof(l5), "Latency identical between OFF (%d) and ON (%d) — the toggle changes only which peak drives gain, not the lookahead/oversampling depth", latOff, latOn);
+        check(latOff == latOn, l5);
+        (void) ceilingLin;
+    }
+
+    // TRUE PEAK OVER must light in Teste A (OFF, true peak over ceiling) and stay dark
+    // in Teste B (ON, true peak held at ceiling) — proving the meter/indicator are not
+    // gated by the True Peak toggle, only gain reduction is.
+    void runTruePeakOverIndicatorFollowsMeterCheck()
+    {
+        const double sr = 48000.0;
+        const int n = (int) sr;
+        const float ceilingDbTP = -1.0f;
+
+        auto render = [&](bool truePeakOn)
+        {
+            LimiterEngine engine;
+            Metering meter;
+            engine.prepare(sr, 512, 2);
+            meter.prepare(sr, 2);
+            engine.setParameters(0.0f, ceilingDbTP, 150.0f, true, LimiterEngine::Character::clean, 100.0f, truePeakOn, false);
+            auto sig = makeIntersamplePeakSignal(2, n, sr);
+            juce::AudioBuffer<float> out(sig);
+            int pos = 0;
+            bool sawOver = false;
+            while (pos < n)
+            {
+                const int bs = juce::jmin(512, n - pos);
+                juce::AudioBuffer<float> chunk(out.getArrayOfWritePointers(), 2, pos, bs);
+                engine.process(chunk);
+                meter.captureOutput(chunk, engine.gainReductionDb(), engine.truePeakDb(), ceilingDbTP, false);
+                if (meter.get().clip) sawOver = true;
+                pos += bs;
+            }
+            return sawOver;
+        };
+
+        check(render(false) == true, "TRUE PEAK OVER lights during Teste A (OFF) when the reconstructed peak exceeds Ceiling");
+        check(render(true) == false, "TRUE PEAK OVER stays dark during Teste B (ON), true peak held at/under Ceiling");
+    }
+
+    // Toggling True Peak mid-playback while actively limiting must not click, silence
+    // the output, zero the meters, or jump gain abruptly — same style of check as the
+    // existing Bypass toggle click test.
+    void runTruePeakToggleTransitionCheck()
+    {
+        const double sr = 48000.0;
+        const int n = (int) sr * 2;
+        LimiterEngine engine;
+        engine.prepare(sr, 256, 2);
+        auto signal = makeIntersamplePeakSignal(2, n, sr);
+        juce::AudioBuffer<float> out(signal);
+
+        int pos = 0, block = 0;
+        bool sawNonZeroPeakThroughout = true;
+        while (pos < n)
+        {
+            const bool truePeakOn = (block / 4) % 2 == 0;
+            engine.setParameters(0.0f, -1.0f, 150.0f, true, LimiterEngine::Character::clean, 100.0f, truePeakOn, false);
+            const int bs = juce::jmin(256, n - pos);
+            juce::AudioBuffer<float> chunk(out.getArrayOfWritePointers(), 2, pos, bs);
+            engine.process(chunk);
+            if (pos > 4000 && engine.truePeakDb() < -90.0f) sawNonZeroPeakThroughout = false;
+            pos += bs;
+            ++block;
+        }
+
+        float maxSecondDeriv = 0.0f;
+        for (int ch = 0; ch < 2; ++ch)
+        {
+            auto* d = out.getReadPointer(ch);
+            for (int i = 2; i < n; ++i)
+                maxSecondDeriv = juce::jmax(maxSecondDeriv, std::abs(d[i] - 2.0f * d[i - 1] + d[i - 2]));
+        }
+        // Baseline: the exact same signal/engine with True Peak held constant (never
+        // toggled) — this signal is a deliberately steep near-Nyquist intersample-peak
+        // provocateur, so it may carry a large inherent 2nd derivative on its own. Only
+        // a max well above this untoggled baseline would indicate a toggle-caused click.
+        float baselineMaxSecondDeriv = 0.0f;
+        {
+            LimiterEngine baselineEngine;
+            baselineEngine.prepare(sr, 256, 2);
+            auto baseSignal = makeIntersamplePeakSignal(2, n, sr);
+            juce::AudioBuffer<float> baseOut(baseSignal);
+            int bpos = 0;
+            while (bpos < n)
+            {
+                baselineEngine.setParameters(0.0f, -1.0f, 150.0f, true, LimiterEngine::Character::clean, 100.0f, true, false);
+                const int bs = juce::jmin(256, n - bpos);
+                juce::AudioBuffer<float> chunk(baseOut.getArrayOfWritePointers(), 2, bpos, bs);
+                baselineEngine.process(chunk);
+                bpos += bs;
+            }
+            for (int ch = 0; ch < 2; ++ch)
+            {
+                auto* d = baseOut.getReadPointer(ch);
+                for (int i = 2; i < n; ++i)
+                    baselineMaxSecondDeriv = juce::jmax(baselineMaxSecondDeriv, std::abs(d[i] - 2.0f * d[i - 1] + d[i - 2]));
+            }
+        }
+
+        char label[280];
+        std::snprintf(label, sizeof(label),
+            "True Peak toggled every 4 blocks: max |2nd derivative| = %.4f vs %.4f for the same signal with True Peak held constant (untoggled baseline)",
+            (double) maxSecondDeriv, (double) baselineMaxSecondDeriv);
+        check(maxSecondDeriv < baselineMaxSecondDeriv * 1.5f + 0.05f, label);
+        check(! hasNonFinite(out), "true-peak-toggle stress buffer stays finite (no silence/dropout)");
+        check(sawNonZeroPeakThroughout, "meter never drops to near-silence while toggling True Peak on active signal");
     }
 
     // CLIP: must be an overload-vs-ceiling indicator (never itself a clipper), triggered
@@ -489,8 +806,8 @@ namespace
         m.captureOutput(quiet, 0.0f, -3.0f, -1.0f, false);
         check(m.get().clip, "CLIP holds briefly after the overload ends, instead of blinking off instantly");
 
-        // Simulate ~750ms of silence (past the ~700ms hold) in 64-sample steps.
-        const int steps = (int) std::ceil(0.75 * sr / 64.0);
+        // Simulate ~1.05s of silence (past the ~1000ms hold) in 64-sample steps.
+        const int steps = (int) std::ceil(1.05 * sr / 64.0);
         for (int i = 0; i < steps; ++i) m.captureOutput(quiet, 0.0f, -3.0f, -1.0f, false);
         check(! m.get().clip, "CLIP clears on its own after the hold window elapses");
 
@@ -539,8 +856,26 @@ int main()
     std::printf("\n-- Stereo Link asymmetric check (impulsive L, quiet constant R) --\n");
     runStereoLinkAsymmetricCheck();
 
+    std::printf("\n-- Stereo Link per-channel curve check (offset impulses on L and R) --\n");
+    runStereoLinkPerChannelCurveCheck();
+
+    std::printf("\n-- Stereo Link mono no-op check --\n");
+    runStereoLinkMonoNoOpCheck();
+
+    std::printf("\n-- Stereo Link bypass no-op check --\n");
+    runStereoLinkBypassNoOpCheck();
+
     std::printf("\n-- CLIP indicator check --\n");
     runClipIndicatorCheck();
+
+    std::printf("\n-- TRUE PEAK algorithm audit (Teste A / Teste B) --\n");
+    runTruePeakAlgorithmAudit();
+
+    std::printf("\n-- TRUE PEAK OVER indicator follows the meter, not the toggle --\n");
+    runTruePeakOverIndicatorFollowsMeterCheck();
+
+    std::printf("\n-- TRUE PEAK toggle transition check --\n");
+    runTruePeakToggleTransitionCheck();
 
     std::printf("\n== %d failure(s), %d warning(s) ==\n", failures, warnings);
     return failures == 0 ? 0 : 1;
