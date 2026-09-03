@@ -300,20 +300,47 @@ void NFLimiterAudioProcessorEditor::requestSavePreset()
     w->addTextEditor("name", "My Preset");
     w->addButton("SAVE", 1);
     w->addButton("CANCEL", 0);
-    // The dialog's callback fires later, asynchronously, whenever the user dismisses
-    // it — by then the plugin editor may already have been closed/destroyed by the
-    // host (a real crash seen with at least one host: the editor window can go away
-    // while this dialog is still up). A SafePointer, not a raw `this`, makes that a
-    // no-op instead of a use-after-free.
+
+    // The dialog's callback fires later, whenever the user dismisses it — by then the
+    // plugin editor could in principle already be gone, so this is a SafePointer, not
+    // a raw `this`.
     juce::Component::SafePointer<NFLimiterAudioProcessorEditor> safeThis(this);
+
+    // THE actual crash cause: `w` is a shared_ptr, kept alive by this very callback —
+    // if `deleteWhenDismissed` is also true, JUCE's modal manager calls `delete` on
+    // the same raw AlertWindow* the instant the modal state ends (i.e. the instant
+    // SAVE/CANCEL is clicked), and the shared_ptr then deletes it *again* when the
+    // callback object is destroyed right after. That double free is what took the
+    // whole host down immediately on every SAVE click. Sole ownership belongs to the
+    // shared_ptr, so this must be false.
     w->enterModalState(true, juce::ModalCallbackFunction::create([safeThis, w](int result)
     {
-        if (result != 1 || safeThis == nullptr) return;
+        DBG("SAVE_CALLBACK_BEGIN");
         const auto name = w->getTextEditorContents("name");
-        if (safeThis->processor.presets.save(name)) safeThis->refreshPresetList();
-        else juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "NF Limiter",
-                                                      "Could not save that preset name (empty, or a factory name).");
-    }), true);
+
+        // Never act on — let alone destroy — the dialog from inside its own
+        // button-click callback. Defer everything (including implicitly releasing
+        // `w`, which happens when this outer callback object is destroyed) to the
+        // next message-loop iteration, once the modal dismissal has fully unwound.
+        juce::MessageManager::callAsync([safeThis, w, result, name]
+        {
+            if (result == 1 && safeThis != nullptr)
+            {
+                if (safeThis->processor.presets.save(name))
+                {
+                    safeThis->refreshPresetList();
+                    DBG("PRESET_LIST_REFRESH");
+                }
+                else
+                {
+                    juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "NF Limiter",
+                                                            "Could not save that preset name (empty, invalid, or a factory name).");
+                }
+            }
+            DBG("DIALOG_CLOSE");
+            DBG("SAVE_CALLBACK_END");
+        });
+    }), false); // deleteWhenDismissed = false: the shared_ptr above owns `w`, not JUCE.
 }
 
 namespace ManualDoc

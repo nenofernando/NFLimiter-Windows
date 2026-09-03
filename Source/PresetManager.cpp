@@ -34,13 +34,52 @@ bool PresetManager::save(const juce::String& name)
     if (trimmed.isEmpty() || isFactory(trimmed)) return false;
 
     auto dir = folder();
-    if (! dir.exists() && ! dir.createDirectory()) return false;
+    if (! dir.exists())
+    {
+        if (! dir.createDirectory())
+        {
+            DBG("DIRECTORY_FAILED");
+            return false;
+        }
+    }
+    DBG("DIRECTORY_OK");
+
+    auto presetFile = dir.getChildFile(juce::File::createLegalFileName(trimmed) + ".nflpreset");
+
+    // Explicit stream + openedOk() check, checked before anything is written: a failed
+    // open (permissions, a locked file, a full disk) returns cleanly instead of ever
+    // dereferencing an invalid stream.
+    juce::FileOutputStream stream(presetFile);
+    if (! stream.openedOk())
+    {
+        DBG("FILE_STREAM_FAILED");
+        return false;
+    }
+    DBG("FILE_STREAM_OK");
 
     auto tree = state.copyState();
+    if (! tree.isValid())
+    {
+        DBG("STATE_COPY_FAILED");
+        return false;
+    }
     tree.setProperty(nfVersionProp, currentVersion, nullptr);
-    if (auto xml = tree.createXml())
-        return xml->writeTo(dir.getChildFile(juce::File::createLegalFileName(trimmed) + ".nflpreset"));
-    return false;
+    DBG("STATE_COPY_OK");
+
+    auto xml = tree.createXml();
+    if (xml == nullptr)
+    {
+        DBG("XML_FAILED");
+        return false;
+    }
+
+    stream.setPosition(0);
+    stream.truncate();
+    xml->writeTo(stream);
+    stream.flush();
+    const bool written = stream.getStatus().wasOk();
+    DBG((written ? "WRITE_OK" : "WRITE_FAILED"));
+    return written;
 }
 
 void PresetManager::migrate(juce::ValueTree& tree, int fromVersion)
