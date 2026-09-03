@@ -65,5 +65,12 @@ if(NF_BUILD_TESTS)
   target_link_libraries(NFLimiterStateTests PRIVATE
     juce::juce_audio_processors juce::juce_dsp juce::juce_audio_utils
     juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
+
+  add_executable(NFLimiterOversamplingAudit Tests/oversampling_audit.cpp Source/LimiterEngine.cpp)
+  target_compile_definitions(NFLimiterOversamplingAudit PRIVATE
+    JUCE_STANDALONE_APPLICATION=1 JUCE_USE_CURL=0 JUCE_WEB_BROWSER=0)
+  target_link_libraries(NFLimiterOversamplingAudit PRIVATE
+    juce::juce_dsp juce::juce_audio_basics juce::juce_audio_formats juce::juce_core
+    juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
 endif()
 
