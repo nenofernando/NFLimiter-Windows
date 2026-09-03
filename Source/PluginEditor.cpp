@@ -300,11 +300,17 @@ void NFLimiterAudioProcessorEditor::requestSavePreset()
     w->addTextEditor("name", "My Preset");
     w->addButton("SAVE", 1);
     w->addButton("CANCEL", 0);
-    w->enterModalState(true, juce::ModalCallbackFunction::create([this, w](int result)
+    // The dialog's callback fires later, asynchronously, whenever the user dismisses
+    // it — by then the plugin editor may already have been closed/destroyed by the
+    // host (a real crash seen with at least one host: the editor window can go away
+    // while this dialog is still up). A SafePointer, not a raw `this`, makes that a
+    // no-op instead of a use-after-free.
+    juce::Component::SafePointer<NFLimiterAudioProcessorEditor> safeThis(this);
+    w->enterModalState(true, juce::ModalCallbackFunction::create([safeThis, w](int result)
     {
-        if (result != 1) return;
+        if (result != 1 || safeThis == nullptr) return;
         const auto name = w->getTextEditorContents("name");
-        if (processor.presets.save(name)) refreshPresetList();
+        if (safeThis->processor.presets.save(name)) safeThis->refreshPresetList();
         else juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "NF Limiter",
                                                       "Could not save that preset name (empty, or a factory name).");
     }), true);
@@ -481,18 +487,22 @@ void NFLimiterAudioProcessorEditor::showMainMenu()
     m.addItem(5, "Reset Integrated Loudness (LUFS-I)");
     m.addSeparator();
     m.addItem(6, "About");
-    m.showMenuAsync({}, [this](int r)
+    // Same lifetime hazard as the SAVE dialog above: this fires later, after the
+    // editor may already be gone.
+    juce::Component::SafePointer<NFLimiterAudioProcessorEditor> safeThis(this);
+    m.showMenuAsync({}, [safeThis](int r)
     {
-        if (r == 1) showManualDialog("Manual - Portugues", true);
-        else if (r == 2) showManualDialog("Manual - English", false);
+        if (safeThis == nullptr) return;
+        if (r == 1) safeThis->showManualDialog("Manual - Portugues", true);
+        else if (r == 2) safeThis->showManualDialog("Manual - English", false);
         else if (r == 3)
         {
-            auto folder = processor.presets.folder();
+            auto folder = safeThis->processor.presets.folder();
             if (! folder.exists()) folder.createDirectory();
             folder.startAsProcess();
         }
-        else if (r == 4) setSize(defaultW, defaultH);
-        else if (r == 5) processor.metering.requestResetIntegrated();
+        else if (r == 4) safeThis->setSize(defaultW, defaultH);
+        else if (r == 5) safeThis->processor.metering.requestResetIntegrated();
         else if (r == 6) juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "NF Limiter V1.0",
                                                                   juce::String::fromUTF8("NF Audio Tools \xE2\x80\x94 By Nenno Fernando"));
     });
