@@ -817,6 +817,93 @@ namespace
         m.captureOutput(quiet, 0.0f, -0.8f, -1.0f, true); // bypass engaged mid-overload
         check(! m.get().clip, "CLIP is forced off the instant Bypass engages, no stale latch");
     }
+
+    // OVERSAMPLING audit: the 1x/2x/4x/8x selector must be more than a label — it has
+    // to change what the True Peak detector actually sees. At 1x there is no
+    // reconstruction filter at all (the "true peak" IS the decimated sample peak), so
+    // on a genuine intersample-peak provocateur, 1x must measure a lower true peak than
+    // 4x/8x, which do reconstruct the real inter-sample excursion. Also confirms
+    // per-factor latency actually differs (the filters are really being switched, not
+    // just relabelled) and that switching factors mid-stream doesn't produce NaN/Inf.
+    void runOversamplingAudit()
+    {
+        const double sr = 48000.0;
+        const int n = (int) sr;
+
+        auto measureTruePeak = [&](int factor)
+        {
+            LimiterEngine engine;
+            engine.prepare(sr, 512, 2);
+            engine.requestOversamplingFactor(factor);
+            // Ceiling set far above the signal so the limiter never engages — this
+            // isolates the detector's raw measurement quality from any gain reduction.
+            engine.setParameters(0.0f, 12.0f, 150.0f, false, LimiterEngine::Character::clean, 100.0f, true, false);
+            auto sig = makeIntersamplePeakSignal(2, n, sr);
+            juce::AudioBuffer<float> out(sig);
+            float maxTp = -100.0f;
+            int pos = 0;
+            while (pos < n)
+            {
+                const int bs = juce::jmin(512, n - pos);
+                juce::AudioBuffer<float> chunk(out.getArrayOfWritePointers(), 2, pos, bs);
+                engine.process(chunk);
+                maxTp = juce::jmax(maxTp, engine.truePeakDb());
+                pos += bs;
+            }
+            return maxTp;
+        };
+
+        const float tp1x = measureTruePeak(1);
+        const float tp2x = measureTruePeak(2);
+        const float tp4x = measureTruePeak(4);
+        const float tp8x = measureTruePeak(8);
+
+        char label[220];
+        std::snprintf(label, sizeof(label),
+            "True peak reading on an intersample-peak signal: 1x=%.3f 2x=%.3f 4x=%.3f 8x=%.3f dBTP (1x must read lower — no reconstruction filter)",
+            (double) tp1x, (double) tp2x, (double) tp4x, (double) tp8x);
+        check(tp1x < tp4x - 0.2f, label); // 1x has no reconstruction filter: must clearly under-read vs 4x
+        check(tp1x < tp8x - 0.2f, "1x under-reads vs 8x by the same margin");
+        // 2x/4x/8x each use a different half-band filter cascade, so their exact ripple
+        // on one specific near-Nyquist test tone need not match to a fraction of a dB —
+        // this only checks they're all in the same ballpark (genuinely reconstructing
+        // the peak), not that they're numerically identical.
+        check(std::abs(tp4x - tp8x) < 1.0f, "4x and 8x land in the same ballpark (both meaningfully resolve this signal's real peak)");
+
+        // Latency must genuinely differ per factor (proves the actual filters differ,
+        // not just a cosmetic index) and must monotonically increase with more taps.
+        LimiterEngine latEngine;
+        latEngine.prepare(sr, 512, 2);
+        const int lat1 = latEngine.latencySamplesFor(1);
+        const int lat2 = latEngine.latencySamplesFor(2);
+        const int lat4 = latEngine.latencySamplesFor(4);
+        const int lat8 = latEngine.latencySamplesFor(8);
+        char latLabel[160];
+        std::snprintf(latLabel, sizeof(latLabel), "Latency increases with factor: 1x=%d 2x=%d 4x=%d 8x=%d samples", lat1, lat2, lat4, lat8);
+        check(lat1 < lat2 && lat2 < lat4 && lat4 < lat8, latLabel);
+
+        // Switching factors mid-stream (as the user actually does by clicking 1x/2x/4x/8x
+        // while audio plays) must not produce NaN/Inf or leave the engine stuck.
+        {
+            LimiterEngine engine;
+            engine.prepare(sr, 256, 2);
+            auto sig = makeIntersamplePeakSignal(2, n, sr);
+            juce::AudioBuffer<float> out(sig);
+            const int factors[] { 1, 2, 4, 8, 4, 2, 1, 8 };
+            int pos = 0, block = 0;
+            while (pos < n)
+            {
+                engine.requestOversamplingFactor(factors[(block / 6) % 8]);
+                engine.setParameters(6.0f, -1.0f, 150.0f, true, LimiterEngine::Character::loud, 100.0f, true, false);
+                const int bs = juce::jmin(256, n - pos);
+                juce::AudioBuffer<float> chunk(out.getArrayOfWritePointers(), 2, pos, bs);
+                engine.process(chunk);
+                pos += bs;
+                ++block;
+            }
+            check(! hasNonFinite(out), "cycling through 1x/2x/4x/8x mid-stream stays finite (no NaN/Inf, no stuck state)");
+        }
+    }
 }
 
 int main()
@@ -867,6 +954,9 @@ int main()
 
     std::printf("\n-- CLIP indicator check --\n");
     runClipIndicatorCheck();
+
+    std::printf("\n-- OVERSAMPLING audit (1x/2x/4x/8x actually change detection) --\n");
+    runOversamplingAudit();
 
     std::printf("\n-- TRUE PEAK algorithm audit (Teste A / Teste B) --\n");
     runTruePeakAlgorithmAudit();
