@@ -192,22 +192,23 @@ public:
     {
         auto textArea = bounds.removeFromBottom(bounds.getHeight() * 0.54f);
         auto ledArea = bounds;
-        const float d = juce::jmin(ledArea.getWidth(), ledArea.getHeight()) * 0.6f;
+        const float d = juce::jmin(ledArea.getWidth(), ledArea.getHeight()) * 0.32f;
         juce::Rectangle<float> led(d, d);
         led.setCentre(ledArea.getCentreX(), ledArea.getCentreY());
 
         if (lit)
         {
-            // Lit: vivid red centre, a small white hot-spot for a luminous look, and a
-            // soft red glow around it.
-            g.setColour(juce::Colour(0xffff2020).withAlpha(0.4f));
-            g.fillEllipse(led.expanded(d * 0.65f));
-            g.setGradientFill(juce::ColourGradient(juce::Colours::white, led.getCentreX(), led.getCentreY(),
-                                                    juce::Colour(0xffe0140f), led.getX(), led.getY(), true));
+            // Lit: a defined, elegant red disc with a small centre highlight for a
+            // physical-LED look, and only a thin (2-3px), low-opacity glow at the rim
+            // — deliberately no large soft radial halo around the component.
+            g.setColour(juce::Colour(0xffe0221a).withAlpha(0.22f));
+            g.fillEllipse(led.expanded(2.5f));
+            g.setGradientFill(juce::ColourGradient(juce::Colour(0xffff5a48), led.getCentreX(), led.getCentreY(),
+                                                    juce::Colour(0xffb31410), led.getX(), led.getY(), true));
             g.fillEllipse(led);
-            g.setColour(juce::Colours::white.withAlpha(0.95f));
-            g.fillEllipse(juce::Rectangle<float>(d * 0.16f, d * 0.16f).withCentre(led.getCentre()));
-            g.setColour(juce::Colours::white.withAlpha(0.55f));
+            g.setColour(juce::Colours::white.withAlpha(0.5f));
+            g.fillEllipse(juce::Rectangle<float>(d * 0.14f, d * 0.14f).withCentre(led.getCentre()));
+            g.setColour(juce::Colours::black.withAlpha(0.5f));
             g.drawEllipse(led, 1.0f);
         }
         else
@@ -219,7 +220,7 @@ public:
             g.drawEllipse(led, 1.0f);
         }
 
-        g.setColour(lit ? juce::Colour(0xffff4030) : NFColour::textDim.withAlpha(0.55f));
+        g.setColour(lit ? juce::Colour(0xffd4392c) : NFColour::textDim.withAlpha(0.55f));
         g.setFont(juce::Font(juce::FontOptions(juce::jmax(8.5f, textArea.getHeight() * 0.30f), juce::Font::bold)).withExtraKerningFactor(0.04f));
         g.drawFittedText("TRUE PEAK\nOVER", textArea.toNearestInt(), juce::Justification::centred, 2);
     }

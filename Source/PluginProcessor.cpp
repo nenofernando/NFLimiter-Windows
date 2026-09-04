@@ -20,14 +20,9 @@ NFLimiterAudioProcessor::NFLimiterAudioProcessor()
       presets(apvts)
 {
     for (auto& v : history) v = 0.0f;
-    apvts.addParameterListener("oversampling", this);
 }
 
-NFLimiterAudioProcessor::~NFLimiterAudioProcessor()
-{
-    apvts.removeParameterListener("oversampling", this);
-    cancelPendingUpdate();
-}
+NFLimiterAudioProcessor::~NFLimiterAudioProcessor() = default;
 
 namespace
 {
@@ -150,19 +145,6 @@ void NFLimiterAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
     }
 
     metering.captureOutput(buffer, blockMinGrDb, blockMaxTruePeakDb, raw("ceiling"), bypassedNow);
-}
-
-void NFLimiterAudioProcessor::parameterChanged(const juce::String& parameterID, float)
-{
-    if (parameterID == "oversampling") triggerAsyncUpdate();
-}
-
-void NFLimiterAudioProcessor::handleAsyncUpdate()
-{
-    // Runs on the message thread: safe place to renegotiate latency with the host
-    // after an oversampling-factor change (the audio thread only flips an atomic).
-    const int factor = oversamplingFactorFromChoice(apvts.getRawParameterValue("oversampling")->load());
-    setLatencySamples(limiter.latencySamplesFor(factor));
 }
 
 void NFLimiterAudioProcessor::getStateInformation(juce::MemoryBlock& destData)

@@ -4,9 +4,7 @@
 #include "Metering.h"
 #include "PresetManager.h"
 
-class NFLimiterAudioProcessor final : public juce::AudioProcessor,
-                                       private juce::AudioProcessorValueTreeState::Listener,
-                                       private juce::AsyncUpdater
+class NFLimiterAudioProcessor final : public juce::AudioProcessor
 {
 public:
     NFLimiterAudioProcessor();
@@ -50,9 +48,6 @@ public:
     std::atomic<int> historyWrite { 0 };
 
 private:
-    void parameterChanged(const juce::String& parameterID, float newValue) override;
-    void handleAsyncUpdate() override;
-
     // 5ms buckets (was 8ms) so narrow drum-hit-length gain-reduction transients get
     // their own bucket instead of being merged into a wider window.
     static constexpr double historyBucketMs = 5.0;

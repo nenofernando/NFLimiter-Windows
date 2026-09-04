@@ -115,8 +115,8 @@ int main()
             for (int factor : factors)
             {
                 auto reference = render(factor, chans, sr, sig, n, false); // one single call
-                LimiterEngine latEngine; latEngine.prepare(sr, n, chans); latEngine.requestOversamplingFactor(factor);
-                const int latency = latEngine.latencySamplesFor(factor);
+                LimiterEngine latEngine; latEngine.requestOversamplingFactor(factor); latEngine.prepare(sr, n, chans);
+                const int latency = latEngine.latencySamples(); // fixed now -- identical for every factor
 
                 float worstForThisConfig = 0.0f;
                 int worstBs = 0;

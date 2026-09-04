@@ -98,6 +98,7 @@ if(NF_BUILD_TESTS)
     juce::juce_dsp juce::juce_audio_basics juce::juce_audio_formats juce::juce_core
     juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
 
+
   add_executable(NFLimiterAsanDetectorCheck Tests/asan_detector_check.cpp Source/LimiterEngine.cpp)
   target_compile_definitions(NFLimiterAsanDetectorCheck PRIVATE
     JUCE_STANDALONE_APPLICATION=1 JUCE_USE_CURL=0 JUCE_WEB_BROWSER=0)
