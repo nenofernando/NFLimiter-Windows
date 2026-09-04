@@ -69,7 +69,15 @@ private:
 
     juce::Slider gain, ceiling, release, link;
     juce::ToggleButton autoRelease { "AUTO" }, truePeak { "ON" };
-    juce::TextButton bypass { "BYPASS" }, power { "" };
+    // BYPASS is a hand-drawn title only (see drawTitle() in paint()) -- power is the
+    // sole clickable control, still driving the same pre-existing "bypass" parameter.
+    juce::TextButton power { "" };
+    // DELTA/LISTEN: a monitoring-only toggle (hears what the limiter removed or
+    // changed), never a sonic parameter -- deliberately not bound to any APVTS
+    // parameter/attachment. See PluginProcessor's deltaListenEnabled for why. Its
+    // title is hand-drawn via drawTitle() in paint(), like every other control in
+    // this row, not a separate juce::Label.
+    juce::TextButton deltaButton { "LISTEN" };
     juce::TextButton characterButtons[3] { juce::TextButton("CLEAN"), juce::TextButton("PUNCH"), juce::TextButton("LOUD") };
     // The OVERSAMPLING selector is gone from the UI: the factor is now chosen
     // automatically from the sample rate (LimiterEngine::tierForSampleRate()). The
@@ -104,7 +112,7 @@ private:
     TruePeakOverIndicator truePeakOverIndicator;
 
     std::unique_ptr<SliderAttachment> gainA, ceilingA, releaseA, linkA;
-    std::unique_ptr<ButtonAttachment> autoA, tpA, bypassA;
+    std::unique_ptr<ButtonAttachment> autoA, tpA;
 
     MeterSnapshot snapshot;
     juce::Rectangle<int> logoBounds;

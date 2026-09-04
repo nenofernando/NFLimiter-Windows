@@ -19,6 +19,7 @@ void LimiterEngine::prepare(double sampleRate, int maximumBlockSize, int newNumC
     if (dspFactor == 1)
     {
         oversampler.reset();
+        deltaRefOversampler.reset();
         osLatencyBaseSamples = 0;
     }
     else
@@ -29,8 +30,19 @@ void LimiterEngine::prepare(double sampleRate, int maximumBlockSize, int newNumC
             juce::dsp::Oversampling<float>::filterHalfBandFIREquiripple, true, true);
         oversampler->initProcessing((size_t) juce::jmax(1, maximumBlockSize));
         osLatencyBaseSamples = (int) std::round(oversampler->getLatencyInSamples());
+
+        // Identical construction to `oversampler` above -- same filter design, same
+        // factor, same latency -- but its own separate instance/filter state, purely
+        // so DELTA/LISTEN's reference can be round-tripped through the same linear
+        // filtering without sharing (and corrupting) the main wet path's own
+        // continuous filter state.
+        deltaRefOversampler = std::make_unique<juce::dsp::Oversampling<float>>(
+            (size_t) numChannels, (size_t) stages,
+            juce::dsp::Oversampling<float>::filterHalfBandFIREquiripple, true, true);
+        deltaRefOversampler->initProcessing((size_t) juce::jmax(1, maximumBlockSize));
     }
     totalLatencyBaseSamples = lookaheadBaseSamples + osLatencyBaseSamples;
+    deltaRefScratch.setSize(numChannels, juce::jmax(1, maximumBlockSize), false, false, true);
 
     delayCapacity = lookaheadOsSamples + 64;
     minRingCapacity = delayCapacity;
@@ -115,6 +127,7 @@ void LimiterEngine::prepare(double sampleRate, int maximumBlockSize, int newNumC
     for (auto& cs : channelState)
     {
         cs.dryBaseDelay.assign((size_t) dryDelayCapacity, 0.0f);
+        cs.gainedRefDelay.assign((size_t) dryDelayCapacity, 0.0f);
         cs.tpGainPeakRing.assign((size_t) tpGainPeakRingCapacity, 0.0f);
         cs.path.delay.assign((size_t) delayCapacity, 0.0f);
         cs.path.minIdxRing.assign((size_t) minRingCapacity, (juce::int64) 0);
@@ -122,6 +135,8 @@ void LimiterEngine::prepare(double sampleRate, int maximumBlockSize, int newNumC
         cs.path.minHead = 0; cs.path.minCount = 0; cs.path.currentGain = 1.0f; cs.path.heldDigitalPeak = 0.0f;
     }
     pathScratch.setSize(numChannels, juce::jmax(1, maximumBlockSize), false, false, true);
+    normalOutputSnapshot.setSize(numChannels, juce::jmax(1, maximumBlockSize), false, false, true);
+    lastProcessedNumSamples = 0;
 
     inputGainSmoothed.reset(baseSampleRate, 0.02);
     ceilingSmoothed.reset(baseSampleRate, 0.02);
@@ -132,16 +147,38 @@ void LimiterEngine::prepare(double sampleRate, int maximumBlockSize, int newNumC
     // 30ms still reads as an instant A/B switch but is long enough (well over one cycle
     // even at ~30Hz) to smooth over the wet/dry level jump.
     bypassMix.reset(baseSampleRate, 0.03); // base rate — the dry crossfade runs post-downsample
+    // 15ms: fast enough to read as an instant toggle, slow enough to never click.
+    deltaMix.reset(baseSampleRate, 0.015);
     inputGainSmoothed.setCurrentAndTargetValue(1.0f);
     ceilingSmoothed.setCurrentAndTargetValue(0.89125f);
     stereoLinkSmoothed.setCurrentAndTargetValue(1.0f);
     bypassMix.setCurrentAndTargetValue(0.0f);
     truePeakBlend.setCurrentAndTargetValue(1.0f);
+    // DELTA/LISTEN always starts OFF on prepare() -- a fresh instance, a sample-rate
+    // change, or a new session must never inherit a previous "listening to Delta"
+    // state. This is a monitoring toggle, not a parameter, so there is no saved value
+    // to restore here in the first place.
+    deltaMix.setCurrentAndTargetValue(0.0f);
+    deltaListenEnabledLast = false;
     // The next setParameters() call snaps directly to its values instead of ramping
     // from these placeholders -- see the comment in setParameters() itself.
     parametersInitialized = false;
 
     reset();
+}
+
+void LimiterEngine::setDeltaListenEnabled(bool enabled) noexcept
+{
+    // Edge-triggered: PluginProcessor calls this every block with whatever the current
+    // atomic says, same as setParameters(). Retargeting the smoother only on an actual
+    // change (rather than every block) is essential -- calling setTargetValue() with
+    // the same value repeatedly would keep resetting the ramp's own step calculation
+    // before it ever finished, so Listen would never actually reach full strength.
+    if (enabled != deltaListenEnabledLast)
+    {
+        deltaMix.setTargetValue(enabled ? 1.0f : 0.0f);
+        deltaListenEnabledLast = enabled;
+    }
 }
 
 void LimiterEngine::reset()
@@ -153,11 +190,13 @@ void LimiterEngine::reset()
     for (auto& cs : channelState)
     {
         std::fill(cs.dryBaseDelay.begin(), cs.dryBaseDelay.end(), 0.0f);
+        std::fill(cs.gainedRefDelay.begin(), cs.gainedRefDelay.end(), 0.0f);
         std::fill(cs.tpGainPeakRing.begin(), cs.tpGainPeakRing.end(), 0.0f);
         std::fill(cs.path.delay.begin(), cs.path.delay.end(), 0.0f);
         cs.path.minHead = 0; cs.path.minCount = 0; cs.path.currentGain = 1.0f; cs.path.heldDigitalPeak = 0.0f;
     }
     if (oversampler) oversampler->reset();
+    if (deltaRefOversampler) deltaRefOversampler->reset();
     if (dedicatedTpOversampler) dedicatedTpOversampler->reset();
     if (dedicatedTpGainOversampler) dedicatedTpGainOversampler->reset();
     currentGrDb.store(0.0f);
@@ -307,7 +346,9 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
             {
                 float raw = d[n];
                 if (! std::isfinite(raw)) raw = 0.0f;
-                g[n] = raw * inputGainRampScratch[(size_t) n];
+                const float gained = raw * inputGainRampScratch[(size_t) n];
+                g[n] = gained;
+                deltaRefScratch.setSample(ch, n, gained);
             }
         }
 
@@ -326,6 +367,30 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
                 if (! std::isfinite(v)) v = 0.0f;
                 cs.tpGainPeakRing[(size_t) ((baseOsIdx + (juce::int64) k) & tpGainPeakRingMask)] = v;
             }
+        }
+    }
+
+    // DELTA/LISTEN's reference: round-trip the post-input-Gain, pre-limiting signal
+    // through deltaRefOversampler -- up, then immediately back down, nothing done in
+    // between -- so it carries the SAME always-present linear filtering/latency the
+    // main wet path itself applies even with no gain reduction at all. Runs
+    // unconditionally (like the dedicated True Peak analyzers above), so the
+    // reference is never stale the instant Listen is engaged. At dspFactor==1 there is
+    // no oversampling filter in the main path either, so deltaRefScratch (already
+    // holding the gained signal) needs no round trip -- it already matches exactly.
+    {
+        if (dspFactor > 1 && deltaRefOversampler != nullptr)
+        {
+            juce::dsp::AudioBlock<float> refBlock(deltaRefScratch.getArrayOfWritePointers(), (size_t) chans, (size_t) numBaseSamples);
+            deltaRefOversampler->processSamplesUp(refBlock);
+            deltaRefOversampler->processSamplesDown(refBlock);
+        }
+        for (int ch = 0; ch < chans; ++ch)
+        {
+            auto& cs = channelState[(size_t) ch];
+            auto* d = deltaRefScratch.getReadPointer(ch);
+            for (int n = 0; n < numBaseSamples; ++n)
+                cs.gainedRefDelay[(size_t) ((baseWritePos + n) % dryDelayCapacity)] = d[n];
         }
     }
 
@@ -565,4 +630,52 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
             if (std::isfinite(d[i])) maxAbsTp = juce::jmax(maxAbsTp, std::abs(d[i]));
     }
     currentTruePeakDb.store(juce::Decibels::gainToDecibels(maxAbsTp, -100.0f));
+
+    // Snapshot the NORMAL final output (post Gain, limiting, Character, Ceiling clamp,
+    // dry/wet crossfade -- exactly what the True Peak detector above just measured)
+    // before any DELTA/LISTEN monitoring is applied: Peak/LUFS metering in
+    // PluginProcessor reads THIS snapshot (see normalOutputForMetering()), not the
+    // buffer that gets sent to the host, so DELTA/LISTEN can never produce a false
+    // meter reading or a false TRUE PEAK OVER alert. Pre-allocated in prepare(); a
+    // plain sample copy, no allocation.
+    for (int ch = 0; ch < chans; ++ch)
+        normalOutputSnapshot.copyFrom(ch, 0, buffer, ch, 0, numBaseSamples);
+    lastProcessedNumSamples = numBaseSamples;
+
+    // DELTA/LISTEN: a monitoring route only, never a sonic parameter. When engaged,
+    // what's actually sent to the host becomes (aligned pre-limiter reference) minus
+    // (this normal final output) -- everything the limiter removed or changed: gain
+    // reduction, Character's colouration, and the ceiling clamp's own effect. The
+    // reference was captured post-input-Gain / pre-limiting and already round-tripped
+    // through deltaRefOversampler above (see gainedRefDelay's own comment for why),
+    // which means it has ALREADY absorbed osLatencyBaseSamples of delay -- the same
+    // amount the main wet path's own oversampling round trip absorbs. What remains to
+    // align it with "normal" (delayed by the FULL totalLatencyBaseSamples =
+    // lookaheadBaseSamples + osLatencyBaseSamples behind the input) is exactly
+    // lookaheadBaseSamples, not the full total -- using the full total here would
+    // double-count the oversampling latency and misalign the two signals by
+    // osLatencyBaseSamples, reintroducing the same comb-filtering-style false Delta
+    // this design otherwise avoids. Complementary raised-linear weights (old+new ==
+    // 1.0, no equal-power bump) ramp over 15ms so toggling mid-playback never clicks.
+    // deltaMix.getNextValue() is called exactly once per sample (not per channel), so
+    // both channels always share the same instantaneous mix value. Bypass forces the
+    // applied mix to 0 unconditionally (bypass cancels Delta) without disturbing the
+    // ramp's own state, so Listen resumes exactly where it left off if bypass is later
+    // released.
+    for (int n = 0; n < numBaseSamples; ++n)
+    {
+        const float mix = deltaMix.getNextValue();
+        const float appliedMix = bypassed ? 0.0f : mix;
+        if (appliedMix <= 0.0f) continue; // skip the per-channel work entirely when Listen is fully off
+        const juce::int64 srcAbs = baseWritePos - numBaseSamples + n - lookaheadBaseSamples;
+        for (int ch = 0; ch < chans; ++ch)
+        {
+            auto& cs = channelState[(size_t) ch];
+            auto* d = buffer.getWritePointer(ch);
+            const float reference = srcAbs >= 0 ? cs.gainedRefDelay[(size_t) (srcAbs % dryDelayCapacity)] : 0.0f;
+            const float normal = d[n];
+            const float delta = reference - normal;
+            d[n] = normal + appliedMix * (delta - normal);
+        }
+    }
 }

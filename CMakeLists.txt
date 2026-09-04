@@ -106,5 +106,12 @@ if(NF_BUILD_TESTS)
     juce::juce_dsp juce::juce_audio_basics juce::juce_audio_formats juce::juce_core
     juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
 
+  add_executable(NFLimiterDeltaListenTests Tests/delta_listen_tests.cpp Source/LimiterEngine.cpp)
+  target_compile_definitions(NFLimiterDeltaListenTests PRIVATE
+    JUCE_STANDALONE_APPLICATION=1 JUCE_USE_CURL=0 JUCE_WEB_BROWSER=0)
+  target_link_libraries(NFLimiterDeltaListenTests PRIVATE
+    juce::juce_dsp juce::juce_audio_basics juce::juce_audio_formats juce::juce_core
+    juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
+
 endif()
 

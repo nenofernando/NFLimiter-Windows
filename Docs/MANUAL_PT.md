@@ -19,8 +19,8 @@
 - **Character Clean:** menor coloração.
 - **Character Punch:** recuperação mais rápida para preservar impacto.
 - **Character Loud:** maior densidade e saturação suave controlada.
-- **True Peak:** protege picos reconstruídos entre amostras.
-- **Oversampling:** aumenta a precisão, usando mais CPU.
+- **True Peak:** protege picos reconstruídos entre amostras. A taxa de oversampling usada para essa detecção agora é escolhida automaticamente pela taxa de amostragem do projeto (mais precisão em 44,1/48kHz, proporcionalmente mais leve em taxas altas) — não existe mais um controle de OVERSAMPLING para ajustar, e a latência do plugin nunca muda ao trocar a taxa de amostragem.
+- **Delta / Listen:** controle apenas de monitoração, ao lado de CHARACTER. Ativado, permite ouvir exatamente o que o limitador está removendo ou alterando — redução de ganho, coloração do Character e o efeito do Ceiling — em vez da saída normal. Nunca altera o áudio enviado ao host quando desligado, nunca é salvo em preset/sessão, sempre inicia desligado ao carregar uma sessão ou preset, e é cancelado automaticamente enquanto o Bypass está ativo.
 - **Stereo Link:** 100% mantém a imagem estéreo estável; valores menores permitem ação parcialmente independente.
 
 ## Medidores

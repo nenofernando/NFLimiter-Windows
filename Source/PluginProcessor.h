@@ -47,12 +47,26 @@ public:
     std::array<std::atomic<float>, historyLength> history {};
     std::atomic<int> historyWrite { 0 };
 
+    // DELTA/LISTEN: a monitoring toggle, never a sonic parameter -- deliberately NOT
+    // an APVTS parameter, so it is never saved in state/presets, never automatable by
+    // the host, and never appears in getStateInformation(). Lives on the processor
+    // (not just the editor) so it survives the editor's own window closing and
+    // reopening while this same instance stays loaded. setStateInformation() forces it
+    // back to false on every session/preset recall -- see there.
+    std::atomic<bool> deltaListenEnabled { false };
+    void setDeltaListenEnabled(bool enabled) noexcept { deltaListenEnabled.store(enabled, std::memory_order_release); }
+    bool isDeltaListenEnabled() const noexcept { return deltaListenEnabled.load(std::memory_order_acquire); }
+
 private:
     // 5ms buckets (was 8ms) so narrow drum-hit-length gain-reduction transients get
     // their own bucket instead of being merged into a wider window.
     static constexpr double historyBucketMs = 5.0;
     int historyChunkSamples = 128; // recomputed from the real sample rate in prepareToPlay
     float displayedGrForHistory = 0.0f; // audio-thread-only: short visual-only smoothing
+    // Accumulates the NORMAL (pre-DELTA/LISTEN) output across a host block's
+    // sub-chunks, for metering -- see the capture loop in processBlock(). Sized in
+    // prepareToPlay(); never resized in processBlock().
+    juce::AudioBuffer<float> normalOutputScratch;
 
     LimiterEngine limiter;
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(NFLimiterAudioProcessor)

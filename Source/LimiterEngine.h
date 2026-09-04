@@ -57,6 +57,23 @@ public:
 
     void process(juce::AudioBuffer<float>& buffer);
 
+    // DELTA/LISTEN: a monitoring route only, never a sonic parameter -- not saved in
+    // state/presets, not host-automatable (there is deliberately no APVTS parameter
+    // for it; the processor holds its own std::atomic<bool> and calls this once per
+    // block, mirroring setParameters()). Edge-triggered: only retargets the internal
+    // 15ms smoother when the requested state actually changes, so calling this with
+    // the same value every block (as the processor will) never restarts the ramp.
+    void setDeltaListenEnabled(bool enabled) noexcept;
+    // A view (no copy, no allocation) over the NORMAL final output -- post Gain,
+    // limiting, Character, Ceiling clamp, dry/wet crossfade -- captured just before
+    // DELTA/LISTEN's monitoring mix is applied to the buffer actually sent to the
+    // host. PluginProcessor's metering must read THIS, not the host buffer, so
+    // Peak/True Peak/LUFS/TRUE PEAK OVER never reflect the Delta signal.
+    juce::AudioBuffer<float> normalOutputForMetering() noexcept
+    {
+        return juce::AudioBuffer<float>(normalOutputSnapshot.getArrayOfWritePointers(), numChannels, lastProcessedNumSamples);
+    }
+
     // Total latency in base-rate samples: lookahead plus the DSP oversampler's own
     // filter latency at the tier-selected factor. Fixed once prepare() runs; never
     // changes afterwards (there is only ever one factor to report).
@@ -111,6 +128,19 @@ private:
         // Per-dedicated-oversampled-tick ring of the feed-forward True Peak analyzer's
         // |output|, delay-compensated on read -- see dedicatedTpGainLatencyBaseSamples.
         std::vector<float> tpGainPeakRing;
+        // DELTA/LISTEN's reference: base-rate ring of the post-input-Gain, pre-limiting
+        // signal -- AFTER it has been round-tripped through deltaRefOversampler (the
+        // same filter design as the main DSP oversampler, but with nothing done
+        // between the up and down passes), so it carries the identical always-present
+        // linear filtering/latency the main "wet" path itself introduces even when
+        // idle. Without this, the reference would be a comb-filtered false Delta: the
+        // oversampling filter's own ordinary response would look like something "the
+        // limiter removed" even at 0dB gain reduction. Delay-compensated by
+        // lookaheadBaseSamples on read (NOT the full totalLatencyBaseSamples: this
+        // value has already absorbed the oversampler's own round-trip latency, same as
+        // the main path's own wet signal has at the equivalent point) so it lines up
+        // sample-for-sample with the final output.
+        std::vector<float> gainedRefDelay;
     };
 
     static void pushMin(PathState& ps, juce::int64 idx, float value, int ringCapacity) noexcept;
@@ -133,6 +163,19 @@ private:
     int osLatencyBaseSamples = 0;   // DSP oversampler's own filter latency, in base-rate samples
     int lookaheadOsSamples = 0;     // lookahead length at dspFactor's rate
     int totalLatencyBaseSamples = 0; // lookaheadBaseSamples + osLatencyBaseSamples -- reported to the host
+
+    // DELTA/LISTEN's dedicated reference oversampler: identical filter design and
+    // factor to `oversampler` above, but a completely separate instance (its own
+    // filter state) purely so DELTA's reference signal can be round-tripped
+    // (up-then-immediately-down, nothing done in between) through the SAME linear
+    // filtering the main wet path always applies -- without this, a raw base-rate
+    // reference would compare a filtered signal (normal output) against an unfiltered
+    // one (reference), producing comb-filtering-style false Delta content even at 0dB
+    // gain reduction. Runs unconditionally (like the dedicated True Peak analyzers)
+    // so there is never a stale/cold reference the instant Listen is engaged. Null
+    // when dspFactor == 1, matching `oversampler` (no filtering to replicate).
+    std::unique_ptr<juce::dsp::Oversampling<float>> deltaRefOversampler;
+    juce::AudioBuffer<float> deltaRefScratch;
 
     juce::int64 writePos = 0, readPos = 0;
 
@@ -192,6 +235,17 @@ private:
     // flipping the button blends smoothly. See process()/the peak-candidate combination
     // for why activation (OFF->ON) does not simply follow this ramp linearly.
     juce::SmoothedValue<float> truePeakBlend;
+    // DELTA/LISTEN's own crossfade: 0 = normal output, 1 = (reference - normal). 15ms,
+    // base rate, complementary weights. Edge-triggered by setDeltaListenEnabled() --
+    // see there for why calling it every block with an unchanged value is safe.
+    juce::SmoothedValue<float> deltaMix;
+    bool deltaListenEnabledLast = false;
+    // Snapshot of the normal final output for PluginProcessor's metering -- see
+    // normalOutputForMetering(). Owned storage, sized to maxBlockSize in prepare();
+    // lastProcessedNumSamples records how many of its samples are valid from the most
+    // recent process() call (a host block can be smaller than maxBlockSize).
+    juce::AudioBuffer<float> normalOutputSnapshot;
+    int lastProcessedNumSamples = 0;
     float releaseMs = 150.0f;
     bool autoRelease = true;
     bool truePeakEnabled = true;

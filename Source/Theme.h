@@ -253,6 +253,39 @@ public:
             return;
         }
 
+        if (btn.getComponentID() == "delta")
+        {
+            // DELTA/LISTEN is a monitoring toggle, deliberately never blue (True
+            // Peak's own colour) so it can never be mistaken for a sonic control.
+            // OFF: dark, discreet, with a small orange accent stripe hinting at what
+            // the button will look like when engaged. ON: a dark-orange face with an
+            // orange outline and a very subtle glow -- distinct but not alarming.
+            if (on)
+            {
+                g.setColour(NFColour::knobOrange.withAlpha(0.20f));
+                g.fillRoundedRectangle(bounds.expanded(2.5f), corner + 2.5f);
+                g.setColour(juce::Colour(0xff5a3510));
+                g.fillRoundedRectangle(bounds, corner);
+                g.setColour(NFColour::knobOrange.withAlpha(0.85f));
+                g.drawRoundedRectangle(bounds, corner, 1.3f);
+            }
+            else
+            {
+                g.setColour(juce::Colour(down ? 0xff1c2028 : 0xff15181e));
+                g.fillRoundedRectangle(bounds, corner);
+                g.setColour(juce::Colours::black.withAlpha(0.7f));
+                g.drawRoundedRectangle(bounds, corner, 1.0f);
+                g.setColour(NFColour::knobOrange.withAlpha(0.5f));
+                g.fillRect(bounds.getX() + corner * 0.5f, bounds.getBottom() - 2.0f, bounds.getWidth() - corner, 2.0f);
+                if (highlighted)
+                {
+                    g.setColour(juce::Colours::white.withAlpha(0.06f));
+                    g.fillRoundedRectangle(bounds, corner);
+                }
+            }
+            return;
+        }
+
         const auto accent = btn.findColour(juce::TextButton::buttonOnColourId);
 
         if (on)

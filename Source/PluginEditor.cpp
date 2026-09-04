@@ -87,35 +87,59 @@ namespace NFLayout
     static constexpr float secondaryControlCenterY = 955.0f;
     static constexpr float minimumGroupGap = 12.0f;
 
-    // Shifted right so the RELEASE knob shares the exact same centre X as the GAIN
-    // knob above it (both at design-space x=188) instead of sitting 36px to its left.
-    static const R releaseTitle    { 76, titleBaselineY, 225, 24 };
-    static const R releaseKnob     { 143, controlCenterY - 45.0f, 90, 90 };
-    static const R releaseValue    { 76, valueBaselineY, 225, 22 };
-    static const R autoPill        { 113, secondaryControlCenterY - 13.0f, 150, 26 };
+    // Bottom-row vertical axes are DERIVED from the real bounds of the upper elements
+    // they must align with -- never eyeballed -- per explicit spec:
+    //   RELEASE     <-> centreX of the INPUT/GAIN panel (leftPanel)
+    //   CHARACTER   <-> centreX the "NF Limiter" title and the "0.0 dB" gain-reduction
+    //                   number are ACTUALLY drawn on -- grPanel.getCentreX(), NOT the
+    //                   static titleText rect's own centre (715): paint() recentres
+    //                   both the title and grNumber onto grPanel's axis (see the
+    //                   "share the GAIN REDUCTION panel's centreX" comment further
+    //                   down), so that -- not titleText itself -- is the real bound.
+    //   BYPASS      <-> centreX of the TRUE PEAK OVER column (clipBox)
+    //   STEREO LINK <-> centreX of the CEILING knob (ceilingKnob)
+    // TRUE PEAK and DELTA sit at fixed fractions between their neighbours (0.46 of the
+    // way from RELEASE to CHARACTER; 0.63 of the way from CHARACTER to BYPASS) so the
+    // whole row reads as one continuous, evenly-paced sequence rather than two
+    // independently-centred pairs with an arbitrary gap between them.
+    static const float releaseAxisX    = leftPanel.getCentreX();
+    static const float characterAxisX  = grPanel.getCentreX();
+    static const float bypassAxisX     = clipBox.getCentreX();
+    static const float stereoLinkAxisX = ceilingKnob.getCentreX();
+    static const float truePeakAxisX   = juce::jmap(0.46f, releaseAxisX, characterAxisX);
+    static const float deltaAxisX      = juce::jmap(0.63f, characterAxisX, bypassAxisX);
 
-    // Left edge stays put (minimumGroupGap from RELEASE). Widened to absorb roughly
-    // half the space the removed OVERSAMPLING block used to occupy, now that automatic
-    // oversampling means there is no user-facing selector for it.
-    static const R characterTitle  { 313, titleBaselineY, 300, 24 };
-    static const R characterBox    { 313, controlCenterY - 45.0f, 300, 90 };
+    static R centredAt(float centreX, float top, float width, float height)
+    {
+        return { centreX - width * 0.5f, top, width, height };
+    }
 
-    // Centred on the GAIN REDUCTION panel's own centreX (672.5), not on the group's
-    // own arbitrary column position — same axis as the header title and the GR block.
-    // This axis is fixed and must not move for any spacing adjustment.
-    static const R truePeakTitle   { grPanel.getCentreX() - 155.0f * 0.5f, titleBaselineY, 155, 24 };
-    static const R truePeakButton  { grPanel.getCentreX() - 110.0f * 0.5f, controlCenterY - 29.0f, 110, 58 };
+    static const R releaseTitle    = centredAt(releaseAxisX, titleBaselineY, 225, 24);
+    static const R releaseKnob     = centredAt(releaseAxisX, controlCenterY - 45.0f, 90, 90);
+    static const R releaseValue    = centredAt(releaseAxisX, valueBaselineY, 225, 22);
+    static const R autoPill        = centredAt(releaseAxisX, secondaryControlCenterY - 13.0f, 150, 26);
 
-    // Shifted left to close the gap the OVERSAMPLING block used to fill (removed: the
-    // factor is now chosen automatically, with no user-facing selector).
-    static const R linkTitle       { 820, titleBaselineY, 185, 24 };
-    static const R linkKnob        { 867, controlCenterY - 45.0f, 90, 90 };
-    static const R linkValue       { 820, valueBaselineY, 185, 26 };
+    static const R truePeakTitle   = centredAt(truePeakAxisX, titleBaselineY, 155, 24);
+    static const R truePeakButton  = centredAt(truePeakAxisX, controlCenterY - 29.0f, 110, 58);
 
-    // Both re-centred on the CEILING knob above them (design x=1348) rather than on
-    // their own original column, per explicit request.
-    static const R powerButton     { ceilingKnob.getCentreX() - 112.5f, 868, 225, 58 };
-    static const R bypassButton    { ceilingKnob.getCentreX() - 65.0f, 808.5f, 130, 38 };
+    static const R characterTitle  = centredAt(characterAxisX, titleBaselineY, 300, 24);
+    static const R characterBox    = centredAt(characterAxisX, controlCenterY - 45.0f, 300, 90);
+
+    static const R deltaTitle      = centredAt(deltaAxisX, titleBaselineY, 78, 24);
+    static const R deltaButtonBox  = centredAt(deltaAxisX, controlCenterY - 29.0f, 78, 58);
+
+    // BYPASS is a title only (no button, no click target -- see the ctor/paint()):
+    // the purple POWER button below it is the sole clickable bypass control. Both
+    // narrowed from their old (225px) width -- that width fit the previous two-button
+    // layout, but collides with DELTA once BYPASS is squeezed into an evenly-paced
+    // six-zone row. Kept a noticeably larger vertical gap between the title and the
+    // button than the other zones use, per the reference image.
+    static const R bypassTitle     = centredAt(bypassAxisX, titleBaselineY, 150, 24);
+    static const R powerButton     = centredAt(bypassAxisX, 868, 130, 54);
+
+    static const R linkTitle       = centredAt(stereoLinkAxisX, titleBaselineY, 185, 24);
+    static const R linkKnob        = centredAt(stereoLinkAxisX, controlCenterY - 45.0f, 90, 90);
+    static const R linkValue       = centredAt(stereoLinkAxisX, valueBaselineY, 185, 26);
 }
 
 // --------------------------------------------------------------------- ChoiceGroup --
@@ -180,21 +204,41 @@ NFLimiterAudioProcessorEditor::NFLimiterAudioProcessorEditor(NFLimiterAudioProce
     autoRelease.setTooltip("Automatically scale release time with the amount of gain reduction.");
     truePeak.setTooltip("Detect true (intersample) peaks instead of sample peaks only.");
 
-    addAndMakeVisible(bypass);
+    // DELTA/LISTEN: a monitoring-only toggle, not a parameter -- no APVTS attachment,
+    // so it is never automated, never saved in a preset, and never restored on
+    // recall. Starts reflecting whatever the processor's own atomic currently says
+    // (false on a fresh instance; still false right after a state/preset load, since
+    // the processor forces it off there) rather than assuming OFF, so closing and
+    // reopening only the editor window on the same instance preserves the state.
+    addAndMakeVisible(deltaButton);
+    deltaButton.setComponentID("delta");
+    deltaButton.setClickingTogglesState(true);
+    deltaButton.setToggleState(processor.isDeltaListenEnabled(), juce::dontSendNotification);
+    deltaButton.setTooltip("Listen to the signal removed or changed by the limiter (monitoring only -- never saved, never automated).");
+    deltaButton.onClick = [this]
+    {
+        processor.setDeltaListenEnabled(deltaButton.getToggleState());
+    };
+
+    // BYPASS is a title only now -- no button, no click target, no background/border
+    // (see paint(), which hand-draws "BYPASS" via drawTitle() like every other zone's
+    // title). The purple POWER button is the SOLE clickable bypass control; it still
+    // drives the very same, pre-existing "bypass" APVTS parameter (no second
+    // parameter, no change to the smooth bypass transition itself), just without an
+    // intermediate proxy button.
     addAndMakeVisible(power);
-    bypass.setClickingTogglesState(true);
     power.setClickingTogglesState(true);
     power.setButtonText(juce::String::fromUTF8("\xE2\x8F\xBB"));
     power.setComponentID("power");
     power.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
-    bypass.setTooltip("Bypass the limiter (latency-compensated, click-free).");
     power.setTooltip("Power: lit when the limiter is active (click to toggle bypass).");
-    // Power reflects "is active" (NOT bypassed) rather than mirroring BYPASS directly,
-    // so it lights up purple during normal operation, matching the approved concept.
+    // Power reflects "is active" (NOT bypassed) rather than mirroring the raw "bypass"
+    // parameter directly, so it lights up purple during normal operation, matching
+    // the approved concept -- see timerCallback() for the inverted sync.
     power.onClick = [this]
     {
         if (auto* param = processor.apvts.getParameter("bypass"))
-            param->setValueNotifyingHost(param->convertTo0to1(bypass.getToggleState() ? 0.0f : 1.0f));
+            param->setValueNotifyingHost(param->convertTo0to1(power.getToggleState() ? 0.0f : 1.0f));
     };
 
     std::vector<juce::TextButton*> charBtns;
@@ -236,7 +280,6 @@ NFLimiterAudioProcessorEditor::NFLimiterAudioProcessorEditor(NFLimiterAudioProce
     linkA = std::make_unique<SliderAttachment>(processor.apvts, "stereo_link", link);
     autoA = std::make_unique<ButtonAttachment>(processor.apvts, "auto_release", autoRelease);
     tpA = std::make_unique<ButtonAttachment>(processor.apvts, "true_peak", truePeak);
-    bypassA = std::make_unique<ButtonAttachment>(processor.apvts, "bypass", bypass);
 
     refreshPresetList();
     presets.onChange = [this] { if (presets.getSelectedId() > 0) processor.presets.load(presets.getText()); };
@@ -545,8 +588,16 @@ void NFLimiterAudioProcessorEditor::timerCallback()
 {
     snapshot = processor.metering.get();
     characterGroup.refresh();
-    power.setToggleState(! bypass.getToggleState(), juce::dontSendNotification);
+    // Reads the raw "bypass" parameter directly now that BYPASS is no longer a real
+    // button of its own -- lit (toggle state true) means "active", i.e. NOT bypassed,
+    // matching the approved concept and picking up host automation of the parameter
+    // exactly as the old bypass-button proxy did.
+    power.setToggleState(processor.apvts.getRawParameterValue("bypass")->load() < 0.5f, juce::dontSendNotification);
     truePeakOverIndicator.setLit(snapshot.clip);
+    // Keeps the button in sync if the processor forced Delta off from elsewhere (a
+    // session/preset load) while this window was open -- Delta has no APVTS
+    // attachment to do this automatically.
+    deltaButton.setToggleState(processor.isDeltaListenEnabled(), juce::dontSendNotification);
     repaint();
 }
 
@@ -960,6 +1011,8 @@ void NFLimiterAudioProcessorEditor::paint(juce::Graphics& g)
                releaseValue, juce::Justification::centred);
     drawTitle(g, characterTitle, "CHARACTER", 14.0f);
     drawTitle(g, truePeakTitle, "TRUE PEAK", 14.0f);
+    drawTitle(g, deltaTitle, "DELTA", 14.0f);
+    drawTitle(g, bypassTitle, "BYPASS", 14.0f);
     drawTitle(g, linkTitle, "STEREO LINK", 14.0f);
 
     g.setFont(juce::Font(juce::FontOptions(20.0f, juce::Font::bold)));
@@ -1003,7 +1056,7 @@ void NFLimiterAudioProcessorEditor::resized()
     autoRelease.setBounds(map(autoPill));
 
     truePeak.setBounds(map(truePeakButton));
-    bypass.setBounds(map(bypassButton));
+    deltaButton.setBounds(map(deltaButtonBox));
     power.setBounds(map(powerButton));
     truePeakOverIndicator.setBounds(map(clipBox.withTrimmedTop(10.0f)));
 

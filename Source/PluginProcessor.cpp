@@ -67,6 +67,11 @@ void NFLimiterAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlo
     setLatencySamples(limiter.latencySamples());
     historyChunkSamples = juce::jmax(1, (int) std::round(sampleRate * (historyBucketMs / 1000.0)));
     displayedGrForHistory = 0.0f;
+    normalOutputScratch.setSize(getTotalNumOutputChannels(), juce::jmax(1, samplesPerBlock), false, false, true);
+    // DELTA/LISTEN always starts OFF on a fresh prepare (new instance, or a
+    // sample-rate/config change) -- it is a monitoring toggle, never a saved value.
+    setDeltaListenEnabled(false);
+    limiter.setDeltaListenEnabled(false);
 }
 
 void NFLimiterAudioProcessor::releaseResources()
@@ -96,6 +101,10 @@ void NFLimiterAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
     limiter.setParameters(raw("gain"), raw("ceiling"), raw("release"), raw("auto_release") > 0.5f,
                            (LimiterEngine::Character) juce::roundToInt(raw("character")),
                            raw("stereo_link"), raw("true_peak") > 0.5f, bypassedNow);
+    // DELTA/LISTEN: read once per block, same as every other parameter above, but this
+    // one is deliberately NOT an APVTS parameter (see the field's own comment in
+    // PluginProcessor.h) -- it is a monitoring toggle, not a sonic one.
+    limiter.setDeltaListenEnabled(isDeltaListenEnabled());
 
     // Process in fixed ~8ms sub-chunks (block-size-invariant DSP — proven by the test
     // suite) purely so each GAIN REDUCTION HISTORY bucket holds the real minimum gain
@@ -123,6 +132,17 @@ void NFLimiterAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
         limiter.process(sub);
         blockMaxTruePeakDb = juce::jmax(blockMaxTruePeakDb, limiter.truePeakDb());
 
+        // Accumulate the NORMAL (pre-DELTA/LISTEN) output for this sub-chunk into a
+        // whole-block scratch buffer -- `sub` itself may already hold the Delta-mixed
+        // monitoring signal by now (that's what actually reaches the host), so
+        // metering below reads this snapshot instead, keeping Peak/True
+        // Peak/LUFS/TRUE PEAK OVER accurate to the real master output regardless of
+        // whether Listen is engaged. Plain sample copies into pre-allocated storage --
+        // no allocation.
+        auto normalView = limiter.normalOutputForMetering();
+        for (int ch = 0; ch < normalView.getNumChannels(); ++ch)
+            normalOutputScratch.copyFrom(ch, pos, normalView, ch, 0, chunk);
+
         // bucketGrDb: the real minimum (deepest) gain reduction the limiter applied
         // anywhere in this ~8ms bucket — never the input Gain, never input/output
         // Peak, only Decibels::gainToDecibels(appliedGain) from the limiter itself.
@@ -144,7 +164,8 @@ void NFLimiterAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juc
         pos += chunk;
     }
 
-    metering.captureOutput(buffer, blockMinGrDb, blockMaxTruePeakDb, raw("ceiling"), bypassedNow);
+    juce::AudioBuffer<float> normalWhole(normalOutputScratch.getArrayOfWritePointers(), buffer.getNumChannels(), totalSamples);
+    metering.captureOutput(normalWhole, blockMinGrDb, blockMaxTruePeakDb, raw("ceiling"), bypassedNow);
 }
 
 void NFLimiterAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
@@ -158,6 +179,13 @@ void NFLimiterAudioProcessor::setStateInformation(const void* data, int sizeInBy
     if (auto xml = getXmlFromBinary(data, sizeInBytes))
         if (xml->hasTagName(apvts.state.getType()))
             apvts.replaceState(juce::ValueTree::fromXml(*xml));
+    // DELTA/LISTEN is a monitoring toggle, never a saved value -- every session/preset
+    // recall forces it back off, regardless of whatever state this instance was in
+    // before the load. Only the atomic is touched here (setStateInformation() has no
+    // guarantee of not running concurrently with the audio thread, unlike
+    // prepareToPlay()); the next processBlock() forwards it into the engine safely,
+    // the same as every other block.
+    setDeltaListenEnabled(false);
 }
 
 #ifndef NF_LIMITER_HEADLESS_TESTS
