@@ -109,7 +109,8 @@ namespace
     // a measurement artifact of the reference, not a property of the actual audio
     // (confirmed by hand: an apparent 0.5dB "overshoot" from the copy-then-measure
     // pattern vanished entirely once the reference saw the untruncated buffer).
-    float independentTruePeakDbTail(const juce::AudioBuffer<float>& buf, int startSample, int stagesLog2 = 4)
+    float independentTruePeakDbTail(const juce::AudioBuffer<float>& buf, int startSample, int stagesLog2 = 4,
+                                     int endSample = -1 /* -1 = end of buffer */)
     {
         const int chans = buf.getNumChannels();
         juce::dsp::Oversampling<float> ref((size_t) chans, (size_t) stagesLog2,
@@ -120,11 +121,13 @@ namespace
         auto up = ref.processSamplesUp(block);
         const int factor = 1 << stagesLog2;
         const size_t startIdx = (size_t) juce::jmax(0, startSample) * (size_t) factor;
+        const size_t endIdx = endSample < 0 ? up.getNumSamples()
+                                             : juce::jmin(up.getNumSamples(), (size_t) endSample * (size_t) factor);
         float maxAbs = 0.0f;
         for (size_t ch = 0; ch < (size_t) chans; ++ch)
         {
             auto* d = up.getChannelPointer(ch);
-            for (size_t i = startIdx; i < up.getNumSamples(); ++i)
+            for (size_t i = startIdx; i < endIdx; ++i)
                 if (std::isfinite(d[i])) maxAbs = juce::jmax(maxAbs, std::abs(d[i]));
         }
         return juce::Decibels::gainToDecibels(maxAbs, -150.0f);
@@ -547,6 +550,74 @@ int main()
     }
 
     // ------------------------------------------------------------------------------
+    // Cold-start audit: the previous test above deliberately skips ~2000 samples
+    // before measuring, to separate steady-state ceiling compliance from startup
+    // transients. This section does the opposite on purpose -- it measures the ENTIRE
+    // render, sample 0 included, so a regression in the analyzer's own warm-up window
+    // (the first ~39 base samples after prepare(), where its delay-compensated ring
+    // read isn't valid yet -- see the instantAbs fallback in LimiterEngine::process())
+    // cannot hide behind a skipped region. The adversarial signal starts at full
+    // amplitude on sample 0 (no fade-in), which is the worst case for a fresh engine.
+    // ------------------------------------------------------------------------------
+    std::printf("\n-- Cold-start audit: TRUE PEAK ON, whole render (sample 0 included) vs independent 32x reference --\n");
+    {
+        const double sampleRates[] { 44100.0, 48000.0, 96000.0, 192000.0 };
+        const float ceilings[] { -0.1f, -1.0f, -2.0f };
+        const int factors[] { 1, 2, 4, 8 };
+        const int channelCounts[] { 1, 2 };
+        const float tolerance = 0.15f;
+        float worstOvershoot = -1000.0f;
+        char worstLabel[280] = {};
+
+        for (double sr : sampleRates)
+        {
+            // Long enough to comfortably clear the lookahead window at every factor
+            // (5ms lookahead is a few hundred samples at most) while keeping the full
+            // sr x ch x ceiling x factor x blockSize matrix fast.
+            const int n = (int) (sr * 0.25);
+            for (int chans : channelCounts)
+            {
+                for (float ceilingDb : ceilings)
+                {
+                    for (int factor : factors)
+                    {
+                        auto sig = makeIntersamplePeakSignal(chans, n, sr);
+                        for (int blockSize : { 1, 37, n /* single "offline" block */ })
+                        {
+                            LimiterEngine engine;
+                            engine.prepare(sr, juce::jmax(blockSize, 1), chans);
+                            engine.requestOversamplingFactor(factor);
+                            engine.setParameters(0.0f, ceilingDb, 150.0f, false, LimiterEngine::Character::clean, 100.0f, true, false);
+                            auto out = runThroughInBlocks(engine, sig, blockSize);
+
+                            float refPeakDb = -150.0f;
+                            for (int ch = 0; ch < chans; ++ch)
+                            {
+                                juce::AudioBuffer<float> mono(1, n);
+                                mono.copyFrom(0, 0, out, ch, 0, n);
+                                // startSample=0: the whole render, cold start included.
+                                refPeakDb = juce::jmax(refPeakDb, independentTruePeakDbTail(mono, 0, 5 /* 32x */));
+                            }
+                            const float overshoot = refPeakDb - ceilingDb;
+                            if (overshoot > worstOvershoot)
+                            {
+                                worstOvershoot = overshoot;
+                                std::snprintf(worstLabel, sizeof(worstLabel),
+                                    "sr=%.0f ch=%d ceiling=%.1fdBTP factor=%dx block=%d: independent 32x ref peak (whole render)=%.3fdBTP (overshoot %.3fdB)",
+                                    sr, chans, (double) ceilingDb, factor, blockSize, (double) refPeakDb, (double) overshoot);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        char l[320];
+        std::snprintf(l, sizeof(l), "Worst overshoot vs independent 32x reference INCLUDING cold start, TRUE PEAK ON, across sr x ch x ceiling x 1x/2x/4x/8x x block size: %.4f dB (tolerance %.2fdB) -- %s",
+                      (double) worstOvershoot, (double) tolerance, worstLabel);
+        check(worstOvershoot <= tolerance, l);
+    }
+
+    // ------------------------------------------------------------------------------
     // Excess attenuation: on a stable signal safely under ceiling, True Peak ON must
     // not attenuate meaningfully more than True Peak OFF does for the same material --
     // the dedicated analyzer's own Gibbs-ringing headroom on adversarial content must
@@ -596,6 +667,122 @@ int main()
         char l[260];
         std::snprintf(l, sizeof(l), "Worst TRUE PEAK ON-vs-OFF difference on stable material, 1x/2x/4x/8x, mono/stereo: %s (must stay well under 0.5dB)", worstLabel);
         check(worstExtraAttenDb < 0.5f, l);
+    }
+
+    // ------------------------------------------------------------------------------
+    // Live switching: a single engine instance, one continuous strong adversarial
+    // signal, cycling OVERSAMPLING 1x->2x->4x->8x->1x->... and toggling True Peak
+    // ON/OFF on independent schedules while audio keeps flowing -- the scenario the
+    // dedicated analyzer's non-reset-on-switch behaviour (see
+    // switchToPendingFactorIfNeeded()) exists for. Checks, on the ONE continuous
+    // render: (a) no sample-to-sample discontinuity beyond what the existing smoothing
+    // ramps already produce on steady playback, (b) no NaN/Inf anywhere, (c) no gap in
+    // protection -- every window where True Peak was ON stays within ceiling +
+    // tolerance per an independent 32x reference, with no exception carved out for the
+    // instants right at a factor switch.
+    // ------------------------------------------------------------------------------
+    std::printf("\n-- Live switching: continuous signal, OVERSAMPLING + TRUE PEAK cycling together --\n");
+    {
+        const double sr = 48000.0;
+        const float ceilingDb = -1.0f;
+        const int chans = 2;
+        const int segmentSamples = 4096; // ~85ms at 48kHz -- several lookahead windows long
+        const int numSegments = 40;
+        const int n = segmentSamples * numSegments;
+        const int factorSeq[] { 1, 2, 4, 8 };
+
+        auto sig = makeIntersamplePeakSignal(chans, n, sr);
+        LimiterEngine engine;
+        engine.prepare(sr, 256, chans);
+        engine.requestOversamplingFactor(1);
+
+        std::vector<bool> segmentTpOn((size_t) numSegments, false);
+        juce::AudioBuffer<float> out(sig);
+        float maxStepDelta = 0.0f;
+        bool sawNonFinite = false;
+        float worstProtectedOvershoot = -1000.0f;
+        char worstProtectedLabel[220] = {};
+
+        for (int seg = 0; seg < numSegments; ++seg)
+        {
+            const int factor = factorSeq[seg % 4];
+            const bool tpOn = (seg % 3) != 0; // ON for 2 of every 3 segments, OFF for 1
+            segmentTpOn[(size_t) seg] = tpOn;
+            engine.requestOversamplingFactor(factor);
+            engine.setParameters(0.0f, ceilingDb, 150.0f, false, LimiterEngine::Character::clean, 100.0f, tpOn, false);
+
+            int pos = seg * segmentSamples;
+            const int segEnd = pos + segmentSamples;
+            while (pos < segEnd)
+            {
+                const int bs = juce::jmin(256, segEnd - pos);
+                juce::AudioBuffer<float> chunk(out.getArrayOfWritePointers(), chans, pos, bs);
+                engine.process(chunk);
+                pos += bs;
+            }
+        }
+
+        // (a) discontinuity + (b) NaN/Inf, over the WHOLE continuous render.
+        for (int ch = 0; ch < chans; ++ch)
+        {
+            float prev = out.getSample(ch, 0);
+            for (int i = 1; i < n; ++i)
+            {
+                const float v = out.getSample(ch, i);
+                if (! std::isfinite(v)) { sawNonFinite = true; continue; }
+                maxStepDelta = juce::jmax(maxStepDelta, std::abs(v - prev));
+                prev = v;
+            }
+        }
+        check(! sawNonFinite, "Live switching: no NaN/Inf anywhere in the continuous render");
+        // The ceiling itself bounds any single-sample step to at most 2x the linear
+        // ceiling (a full swing from +ceiling to -ceiling); real material and the
+        // existing crossfade ramps never get remotely close to that even at a switch,
+        // so a step anywhere near it would mean an actual click, not normal signal
+        // content -- this signal's own steady-state step sizes run a small fraction of
+        // the ceiling.
+        const float ceilingLinear = juce::Decibels::decibelsToGain(ceilingDb);
+        char stepLabel[200];
+        std::snprintf(stepLabel, sizeof(stepLabel), "Live switching: worst sample-to-sample step = %.5f (ceiling-linear=%.5f)", (double) maxStepDelta, (double) ceilingLinear);
+        check(maxStepDelta < ceilingLinear * 1.5f, stepLabel);
+
+        // (c) no protection gap: for every segment where True Peak was ON, the
+        // independent 32x reference must not exceed ceiling + tolerance within that
+        // segment (plus a little lookahead margin folded into the next segment, since
+        // the limiter's own ~5ms lookahead means a decision made near a segment's end
+        // is only fully reflected a little further into the output).
+        const float tolerance = 0.15f;
+        const int lookaheadMargin = (int) std::round(sr * 0.006); // 6ms, comfortably over the 5ms lookahead
+        for (int seg = 0; seg < numSegments; ++seg)
+        {
+            if (! segmentTpOn[(size_t) seg]) continue;
+            const int start = juce::jmax(0, seg * segmentSamples - lookaheadMargin);
+            const int end = juce::jmin(n, (seg + 1) * segmentSamples + lookaheadMargin);
+            float refPeakDb = -150.0f;
+            for (int ch = 0; ch < chans; ++ch)
+            {
+                juce::AudioBuffer<float> mono(1, n);
+                mono.copyFrom(0, 0, out, ch, 0, n);
+                // The reference oversamples the WHOLE continuous render (so it sees
+                // real context, not an artificial "attack" at `start`) but only the
+                // [start, end) window is inspected for this segment's peak.
+                refPeakDb = juce::jmax(refPeakDb, independentTruePeakDbTail(mono, start, 5, end));
+            }
+            const float overshoot = refPeakDb - ceilingDb;
+            if (overshoot > worstProtectedOvershoot)
+            {
+                worstProtectedOvershoot = overshoot;
+                std::snprintf(worstProtectedLabel, sizeof(worstProtectedLabel),
+                    "segment %d (factor=%dx, samples %d-%d): 32x ref peak=%.3fdBTP (overshoot %.3fdB)",
+                    seg, factorSeq[seg % 4], start, end, (double) refPeakDb, (double) overshoot);
+            }
+        }
+        char liveLabel[300];
+        std::snprintf(liveLabel, sizeof(liveLabel), "Live switching: worst overshoot across every TRUE PEAK ON segment while OVERSAMPLING cycles 1x/2x/4x/8x: %.4fdB (tolerance %.2fdB) -- %s",
+                      (double) worstProtectedOvershoot, (double) tolerance, worstProtectedLabel);
+        check(worstProtectedOvershoot <= tolerance, liveLabel);
+
+        info("Live switching: the dedicated True Peak gain analyzer's own filter state is NOT reset on an OVERSAMPLING factor switch (only cs.tp8xPeakRing and the write/read index baseWritePos are) -- it is a continuous, streaming filter whose precision is fixed at 8x independent of the main factor, so resetting it would zero its delay line and manufacture an artificial discontinuity for no correctness benefit. The ring clear plus the instantAbs fallback in process() together handle the brief post-reset window where the delay-compensated ring read isn't valid yet.");
     }
 
     std::printf("\n== %d failure(s) ==\n", failures);

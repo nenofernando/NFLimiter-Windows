@@ -176,10 +176,17 @@ void LimiterEngine::switchToPendingFactorIfNeeded()
     if (oversamplers[(size_t) idx]) oversamplers[(size_t) idx]->reset();
     // The dedicated True Peak gain analyzer is fixed at 8x and deliberately untouched by
     // the OVERSAMPLING selector's own factor -- its precision must not change just
-    // because the user picked a different quality factor. Its filter state is reset here
-    // purely for cleanliness alongside the ring/index reset above (baseWritePos restarts
-    // at 0, so any stale ring content indexed under the old numbering must go too).
-    if (dedicatedTpGainOversampler) dedicatedTpGainOversampler->reset();
+    // because the user picked a different quality factor. Its own filter state is
+    // therefore deliberately NOT reset here: it is a continuous, streaming filter whose
+    // internal state has nothing to do with baseWritePos's numbering, so resetting it on
+    // every quality-factor switch would zero its delay line and manufacture a brief,
+    // artificial discontinuity in an otherwise-unbroken reconstruction of the real,
+    // continuous audio -- a protection gap the switch itself does not actually require.
+    // cs.tp8xPeakRing IS cleared above (it is indexed by baseWritePos, which does
+    // restart at 0), and the instantAbs fallback in process() already covers the brief
+    // window where the delay-compensated ring read isn't valid yet after any reset of
+    // that indexing -- so clearing the ring is sufficient; the filter itself does not
+    // need to be, and keeping it running is strictly safer.
 
     const double osRate = baseSampleRate * (double) wanted;
     inputGainSmoothed.reset(osRate, 0.02);
