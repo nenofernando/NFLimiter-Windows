@@ -98,16 +98,28 @@ namespace NFLayout
     //                   down), so that -- not titleText itself -- is the real bound.
     //   BYPASS      <-> centreX of the TRUE PEAK OVER column (clipBox)
     //   STEREO LINK <-> centreX of the CEILING knob (ceilingKnob)
-    // TRUE PEAK and DELTA sit at fixed fractions between their neighbours (0.46 of the
-    // way from RELEASE to CHARACTER; 0.63 of the way from CHARACTER to BYPASS) so the
-    // whole row reads as one continuous, evenly-paced sequence rather than two
-    // independently-centred pairs with an arbitrary gap between them.
+    // TRUE PEAK sits at a fixed fraction between RELEASE and CHARACTER (0.46 of the
+    // way across) so that stretch of the row reads as one continuous, evenly-paced
+    // sequence. DELTA instead sits at the midpoint between the LOUD button's own
+    // centre (the third/rightmost CHARACTER button, not the whole group's centre) and
+    // BYPASS -- per the reference image, DELTA must align with LOUD and BYPASS
+    // specifically, not with an arbitrary fraction of the CHARACTER group's span.
     static const float releaseAxisX    = leftPanel.getCentreX();
     static const float characterAxisX  = grPanel.getCentreX();
     static const float bypassAxisX     = clipBox.getCentreX();
     static const float stereoLinkAxisX = ceilingKnob.getCentreX();
     static const float truePeakAxisX   = juce::jmap(0.46f, releaseAxisX, characterAxisX);
-    static const float deltaAxisX      = juce::jmap(0.63f, characterAxisX, bypassAxisX);
+
+    // Reproduces the exact per-button geometry resized() computes for the CHARACTER
+    // group (see the `characterBox`-based loop further down) so LOUD's own centre can
+    // be derived here without duplicating magic numbers out of sync with that loop.
+    static constexpr float characterBoxWidth = 300.0f;
+    static constexpr float characterBoxPad   = characterBoxWidth * 0.03f;
+    static constexpr float characterBoxGap   = characterBoxWidth * 0.025f;
+    static constexpr float characterBtnW     = (characterBoxWidth - characterBoxPad * 2.0f - characterBoxGap * 2.0f) / 3.0f;
+    static const float loudButtonAxisX = characterAxisX - characterBoxWidth * 0.5f + characterBoxPad
+                                          + characterBtnW * 2.5f + characterBoxGap * 2.0f;
+    static const float deltaAxisX      = (loudButtonAxisX + bypassAxisX) * 0.5f;
 
     static R centredAt(float centreX, float top, float width, float height)
     {
