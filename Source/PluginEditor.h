@@ -71,8 +71,11 @@ private:
     juce::ToggleButton autoRelease { "AUTO" }, truePeak { "ON" };
     juce::TextButton bypass { "BYPASS" }, power { "" };
     juce::TextButton characterButtons[3] { juce::TextButton("CLEAN"), juce::TextButton("PUNCH"), juce::TextButton("LOUD") };
-    juce::TextButton oversamplingButtons[4] { juce::TextButton("1x"), juce::TextButton("2x"), juce::TextButton("4x"), juce::TextButton("8x") };
-    ChoiceButtonGroup characterGroup, oversamplingGroup;
+    // The OVERSAMPLING selector is gone from the UI: the factor is now chosen
+    // automatically from the sample rate (LimiterEngine::tierForSampleRate()). The
+    // "oversampling" APVTS parameter itself is untouched, kept only so old
+    // sessions/automation lanes that reference it still load without error.
+    ChoiceButtonGroup characterGroup;
 
     juce::ComboBox presets;
     juce::TextButton presetPrev { "<" }, presetNext { ">" }, savePreset { "SAVE" }, menu,

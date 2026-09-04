@@ -94,10 +94,11 @@ namespace NFLayout
     static const R releaseValue    { 76, valueBaselineY, 225, 22 };
     static const R autoPill        { 113, secondaryControlCenterY - 13.0f, 150, 26 };
 
-    // Left edge stays put (minimumGroupGap from RELEASE), width trimmed a bit further
-    // so the gap to TRUE PEAK matches TRUE PEAK's gap to OVERSAMPLING on the other side.
-    static const R characterTitle  { 313, titleBaselineY, 247, 24 };
-    static const R characterBox    { 313, controlCenterY - 45.0f, 247, 90 };
+    // Left edge stays put (minimumGroupGap from RELEASE). Widened to absorb roughly
+    // half the space the removed OVERSAMPLING block used to occupy, now that automatic
+    // oversampling means there is no user-facing selector for it.
+    static const R characterTitle  { 313, titleBaselineY, 300, 24 };
+    static const R characterBox    { 313, controlCenterY - 45.0f, 300, 90 };
 
     // Centred on the GAIN REDUCTION panel's own centreX (672.5), not on the group's
     // own arbitrary column position — same axis as the header title and the GR block.
@@ -105,13 +106,11 @@ namespace NFLayout
     static const R truePeakTitle   { grPanel.getCentreX() - 155.0f * 0.5f, titleBaselineY, 155, 24 };
     static const R truePeakButton  { grPanel.getCentreX() - 110.0f * 0.5f, controlCenterY - 29.0f, 110, 58 };
 
-    static const R oversamplingTitle { 775, titleBaselineY, 320, 24 };
-    static const R oversamplingBox   { 785, controlCenterY - 45.0f, 300, 90 };
-
-    // Nudged left ~30px from its original centre for better breathing room before BYPASS/POWER.
-    static const R linkTitle       { 1060, titleBaselineY, 185, 24 };
-    static const R linkKnob        { 1107, controlCenterY - 45.0f, 90, 90 };
-    static const R linkValue       { 1060, valueBaselineY, 185, 26 };
+    // Shifted left to close the gap the OVERSAMPLING block used to fill (removed: the
+    // factor is now chosen automatically, with no user-facing selector).
+    static const R linkTitle       { 820, titleBaselineY, 185, 24 };
+    static const R linkKnob        { 867, controlCenterY - 45.0f, 90, 90 };
+    static const R linkValue       { 820, valueBaselineY, 185, 26 };
 
     // Both re-centred on the CEILING knob above them (design x=1348) rather than on
     // their own original column, per explicit request.
@@ -198,15 +197,17 @@ NFLimiterAudioProcessorEditor::NFLimiterAudioProcessorEditor(NFLimiterAudioProce
             param->setValueNotifyingHost(param->convertTo0to1(bypass.getToggleState() ? 0.0f : 1.0f));
     };
 
-    std::vector<juce::TextButton*> charBtns, osBtns;
+    std::vector<juce::TextButton*> charBtns;
     for (auto& b : characterButtons) { addAndMakeVisible(b); b.setClickingTogglesState(false); b.setComponentID("character"); charBtns.push_back(&b); }
-    for (auto& b : oversamplingButtons) { addAndMakeVisible(b); b.setClickingTogglesState(false); b.setComponentID("oversampling"); osBtns.push_back(&b); }
     characterGroup.bind(processor.apvts, "character", charBtns);
-    oversamplingGroup.bind(processor.apvts, "oversampling", osBtns);
     characterButtons[0].setTooltip("Clean: bit-transparent, no colouration.");
     characterButtons[1].setTooltip("Punch: faster adaptive release keeps transients snappy.");
     characterButtons[2].setTooltip("Loud: adds gentle saturation density on limited peaks.");
-    for (auto& b : oversamplingButtons) b.setTooltip("Oversampling factor for true-peak detection and processing quality.");
+    // The OVERSAMPLING selector has been removed: the factor is now chosen
+    // automatically from the sample rate (see LimiterEngine::tierForSampleRate()).
+    // The underlying "oversampling" APVTS parameter is kept, hidden, only so old
+    // sessions/automation lanes that reference it still load without error -- it no
+    // longer has any visible control or effect on the DSP.
 
     addAndMakeVisible(presets);
     addAndMakeVisible(presetPrev);
@@ -446,7 +447,7 @@ namespace ManualDoc
             B("Compare sempre com Bypass em volume semelhante, para nao confundir volume com melhora real.");
             H("Controles inferiores");
             I(controls);
-            P("RELEASE define a velocidade de recuperacao da reducao de ganho; AUTO adapta essa velocidade a intensidade e duracao dos picos. CHARACTER escolhe o comportamento do limitador: Clean (menor coloracao), Punch (recuperacao mais rapida, preserva impacto) ou Loud (maior densidade, saturacao suave controlada). TRUE PEAK protege picos reconstruidos entre amostras (intersample). OVERSAMPLING aumenta a precisao do true peak trocando por mais uso de CPU (1x/2x/4x/8x). STEREO LINK em 100% mantem a imagem estereo estavel; valores menores permitem acao parcialmente independente entre os canais. BYPASS compara o sinal processado com o original, preservando a mesma cadeia de audio (sem clique, com latencia compensada).");
+            P("RELEASE define a velocidade de recuperacao da reducao de ganho; AUTO adapta essa velocidade a intensidade e duracao dos picos. CHARACTER escolhe o comportamento do limitador: Clean (menor coloracao), Punch (recuperacao mais rapida, preserva impacto) ou Loud (maior densidade, saturacao suave controlada). TRUE PEAK protege picos reconstruidos entre amostras (intersample); a taxa de oversampling usada para essa deteccao e escolhida automaticamente pela taxa de amostragem do projeto. STEREO LINK em 100% mantem a imagem estereo estavel; valores menores permitem acao parcialmente independente entre os canais. BYPASS compara o sinal processado com o original, preservando a mesma cadeia de audio (sem clique, com latencia compensada).");
             H("Medidores");
             P("INPUT e OUTPUT mostram os canais L/R em tempo real. GAIN REDUCTION mostra a atenuacao aplicada agora e seu historico recente. PEAK e TRUE PEAK exibem os valores maximos ja atingidos. LUFS-M indica o loudness momentaneo; LUFS-I acumula desde a abertura do plugin ou o ultimo reset (menu -> Reset LUFS). TRUE PEAK OVER e um indicador passivo (nao e um botao): acende brevemente sempre que a saida pos-limiter ultrapassa o Ceiling em mais de 0,05 dB.");
             H("Presets e menu");
@@ -469,7 +470,7 @@ namespace ManualDoc
             B("Always compare against Bypass at a matched perceived level, so you're judging quality, not just loudness.");
             H("Bottom controls");
             I(controls);
-            P("RELEASE sets how fast gain reduction recovers; AUTO adapts that speed to the intensity and duration of the peaks. CHARACTER picks the limiter's behaviour: Clean (least colouration), Punch (faster recovery, preserves impact) or Loud (denser, gently saturated). TRUE PEAK protects reconstructed inter-sample peaks. OVERSAMPLING trades CPU for true-peak accuracy (1x/2x/4x/8x). STEREO LINK at 100% keeps the stereo image stable; lower values let the channels act more independently. BYPASS compares the processed signal against the original through the same audio chain, click-free and latency-compensated.");
+            P("RELEASE sets how fast gain reduction recovers; AUTO adapts that speed to the intensity and duration of the peaks. CHARACTER picks the limiter's behaviour: Clean (least colouration), Punch (faster recovery, preserves impact) or Loud (denser, gently saturated). TRUE PEAK protects reconstructed inter-sample peaks; the oversampling rate used for that detection is chosen automatically from the project's sample rate. STEREO LINK at 100% keeps the stereo image stable; lower values let the channels act more independently. BYPASS compares the processed signal against the original through the same audio chain, click-free and latency-compensated.");
             H("Meters");
             P("INPUT and OUTPUT show the L/R channels in real time. GAIN REDUCTION shows the attenuation applied right now plus its recent history. PEAK and TRUE PEAK show the highest values reached. LUFS-M is momentary loudness; LUFS-I accumulates since the plugin opened or the last reset (menu -> Reset LUFS). TRUE PEAK OVER is a passive indicator (never a button): it lights briefly whenever the post-limiter output exceeds the Ceiling by more than 0.05 dB.");
             H("Presets and menu");
@@ -544,7 +545,6 @@ void NFLimiterAudioProcessorEditor::timerCallback()
 {
     snapshot = processor.metering.get();
     characterGroup.refresh();
-    oversamplingGroup.refresh();
     power.setToggleState(! bypass.getToggleState(), juce::dontSendNotification);
     truePeakOverIndicator.setLit(snapshot.clip);
     repaint();
@@ -953,7 +953,6 @@ void NFLimiterAudioProcessorEditor::paint(juce::Graphics& g)
     g.drawLine(clipBox.getX() + 10.0f, clipBox.getY(), clipBox.getRight() - 10.0f, clipBox.getY(), 1.0f);
 
     drawGroupBox(g, characterBox);
-    drawGroupBox(g, oversamplingBox);
     drawTitle(g, releaseTitle, "RELEASE", 14.0f);
     g.setFont(juce::Font(juce::FontOptions(15.0f, juce::Font::bold)));
     g.setColour(juce::Colours::white);
@@ -961,7 +960,6 @@ void NFLimiterAudioProcessorEditor::paint(juce::Graphics& g)
                releaseValue, juce::Justification::centred);
     drawTitle(g, characterTitle, "CHARACTER", 14.0f);
     drawTitle(g, truePeakTitle, "TRUE PEAK", 14.0f);
-    drawTitle(g, oversamplingTitle, "OVERSAMPLING", 14.0f);
     drawTitle(g, linkTitle, "STEREO LINK", 14.0f);
 
     g.setFont(juce::Font(juce::FontOptions(20.0f, juce::Font::bold)));
@@ -1016,14 +1014,6 @@ void NFLimiterAudioProcessorEditor::resized()
         const float w = (inner.getWidth() - gap * 2.0f) / 3.0f;
         for (int i = 0; i < 3; ++i)
             characterButtons[i].setBounds(map(inner.withX(inner.getX() + i * (w + gap)).withWidth(w)));
-    }
-    {
-        auto box = oversamplingBox;
-        const float pad = box.getWidth() * 0.03f, gap = box.getWidth() * 0.02f;
-        auto inner = box.reduced(pad, box.getHeight() * 0.1f);
-        const float w = (inner.getWidth() - gap * 3.0f) / 4.0f;
-        for (int i = 0; i < 4; ++i)
-            oversamplingButtons[i].setBounds(map(inner.withX(inner.getX() + i * (w + gap)).withWidth(w)));
     }
 
     resizer.setBounds(getWidth() - 22, getHeight() - 22, 22, 22);

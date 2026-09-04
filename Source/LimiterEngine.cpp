@@ -10,50 +10,34 @@ void LimiterEngine::prepare(double sampleRate, int maximumBlockSize, int newNumC
     // stereoLinkSmoothed/truePeakBlend.
     rampSettleBaseSamples = juce::jmax(1, (int) std::round(baseSampleRate * 0.02));
 
-    for (int i = 0; i < kNumOsSlots; ++i)
+    // Automatic oversampling: the DSP factor and the True Peak analyzer/meter factor
+    // are chosen ONCE here, purely from the sample rate -- see tierForSampleRate() and
+    // the class-level comment. No user control, no runtime switching, no crossfade.
+    tierForSampleRate(sampleRate, dspFactor, tpFactor);
+
+    lookaheadOsSamples = lookaheadBaseSamples * dspFactor;
+    if (dspFactor == 1)
     {
-        const int factor = kOsFactors[i];
-        lookaheadOsSamples[(size_t) i] = lookaheadBaseSamples * factor;
-
-        if (factor == 1)
-        {
-            oversamplers[(size_t) i].reset();
-            osLatencyBaseSamples[(size_t) i] = 0;
-        }
-        else
-        {
-            const int stages = (int) std::round(std::log2((double) factor));
-            oversamplers[(size_t) i] = std::make_unique<juce::dsp::Oversampling<float>>(
-                (size_t) numChannels, (size_t) stages,
-                juce::dsp::Oversampling<float>::filterHalfBandFIREquiripple, true, true);
-            oversamplers[(size_t) i]->initProcessing((size_t) juce::jmax(1, maximumBlockSize));
-            osLatencyBaseSamples[(size_t) i] = (int) std::round(oversamplers[(size_t) i]->getLatencyInSamples());
-        }
-        totalLatencyBaseSamples[(size_t) i] = lookaheadBaseSamples + osLatencyBaseSamples[(size_t) i];
+        oversampler.reset();
+        osLatencyBaseSamples = 0;
     }
-
-    // Fixed, worst-case latency across every factor -- reported to the host and never
-    // changed afterwards (only recomputed here, in prepare(), on a genuine sample-rate/
-    // block-size/channel-count change). Every factor's own shortfall against this figure
-    // is made up with an internal, pure-delay padding stage (see runPath()), so every
-    // factor's REAL physical latency is identical to the reported one at all times --
-    // switching factors live never changes the host's plugin-delay-compensation.
-    fixedLatencyBaseSamples = 0;
-    for (int i = 0; i < kNumOsSlots; ++i)
-        fixedLatencyBaseSamples = juce::jmax(fixedLatencyBaseSamples, totalLatencyBaseSamples[(size_t) i]);
-    int maxPadding = 0;
-    for (int i = 0; i < kNumOsSlots; ++i)
+    else
     {
-        paddingSamplesForFactor[(size_t) i] = fixedLatencyBaseSamples - totalLatencyBaseSamples[(size_t) i];
-        maxPadding = juce::jmax(maxPadding, paddingSamplesForFactor[(size_t) i]);
+        const int stages = (int) std::round(std::log2((double) dspFactor));
+        oversampler = std::make_unique<juce::dsp::Oversampling<float>>(
+            (size_t) numChannels, (size_t) stages,
+            juce::dsp::Oversampling<float>::filterHalfBandFIREquiripple, true, true);
+        oversampler->initProcessing((size_t) juce::jmax(1, maximumBlockSize));
+        osLatencyBaseSamples = (int) std::round(oversampler->getLatencyInSamples());
     }
-    paddingRingCapacity = maxPadding + juce::jmax(1, maximumBlockSize) + 64;
+    totalLatencyBaseSamples = lookaheadBaseSamples + osLatencyBaseSamples;
 
-    delayCapacity = lookaheadOsSamples[kNumOsSlots - 1] + 64;
+    delayCapacity = lookaheadOsSamples + 64;
     minRingCapacity = delayCapacity;
 
+    const int tpStages = (int) std::round(std::log2((double) tpFactor));
     dedicatedTpOversampler = std::make_unique<juce::dsp::Oversampling<float>>(
-        (size_t) numChannels, (size_t) kDedicatedTpStages,
+        (size_t) numChannels, (size_t) tpStages,
         juce::dsp::Oversampling<float>::filterHalfBandPolyphaseIIR, true, false);
     dedicatedTpOversampler->initProcessing((size_t) juce::jmax(1, maximumBlockSize));
     dedicatedTpScratch.setSize(numChannels, juce::jmax(1, maximumBlockSize), false, false, true);
@@ -61,7 +45,7 @@ void LimiterEngine::prepare(double sampleRate, int maximumBlockSize, int newNumC
     // FIR equiripple (linear-phase), not polyphase IIR: see the class-level comment on
     // dedicatedTpGainOversampler for why this filter family is required here.
     dedicatedTpGainOversampler = std::make_unique<juce::dsp::Oversampling<float>>(
-        (size_t) numChannels, (size_t) kDedicatedTpGainStages,
+        (size_t) numChannels, (size_t) tpStages,
         juce::dsp::Oversampling<float>::filterHalfBandFIREquiripple, true, true);
     dedicatedTpGainOversampler->initProcessing((size_t) juce::jmax(1, maximumBlockSize));
     dedicatedTpGainScratch.setSize(numChannels, juce::jmax(1, maximumBlockSize), false, false, true);
@@ -77,7 +61,7 @@ void LimiterEngine::prepare(double sampleRate, int maximumBlockSize, int newNumC
     // impulse) is exact at every frequency, not just the one the impulse happens to
     // emphasise -- unlike polyphase IIR, whose group delay varies with frequency.
     {
-        juce::dsp::Oversampling<float> calibOs(1, (size_t) kDedicatedTpGainStages,
+        juce::dsp::Oversampling<float> calibOs(1, (size_t) tpStages,
             juce::dsp::Oversampling<float>::filterHalfBandFIREquiripple, true, true);
         const int calibN = 1024;
         calibOs.initProcessing((size_t) calibN);
@@ -95,9 +79,9 @@ void LimiterEngine::prepare(double sampleRate, int maximumBlockSize, int newNumC
             const float v = std::abs(up0[i]);
             if (v > peakVal) { peakVal = v; peakIdx = (int) i; }
         }
-        const double delayOsSamples = (double) peakIdx - (double) impulsePos * kGainAnalysisFactor;
+        const double delayOsSamples = (double) peakIdx - (double) impulsePos * tpFactor;
         dedicatedTpGainLatencyOsSamples = juce::jmax(0, (int) std::round(delayOsSamples));
-        dedicatedTpGainLatencyBaseSamples = juce::jmax(0, (int) std::round(delayOsSamples / (double) kGainAnalysisFactor));
+        dedicatedTpGainLatencyBaseSamples = juce::jmax(0, (int) std::round(delayOsSamples / (double) tpFactor));
     }
     inputGainRampScratch.assign((size_t) juce::jmax(1, maximumBlockSize), 1.0f);
     ceilRampScratch.assign((size_t) juce::jmax(1, maximumBlockSize), 0.89125f);
@@ -111,58 +95,33 @@ void LimiterEngine::prepare(double sampleRate, int maximumBlockSize, int newNumC
     // truncating the compensation.
     jassert(dedicatedTpGainLatencyBaseSamples <= lookaheadBaseSamples);
 
-    // dryDelayCapacity now sized off the fixed, factor-independent latency: the dry
-    // path writes an entire block and reads it back in a second pass, so the ring must
-    // hold at least one full block on top of the latency, or a large block wraps around
-    // and clobbers samples before they're ever read.
-    dryDelayCapacity = fixedLatencyBaseSamples + juce::jmax(1, maxBlockSize) + 64;
+    // dryDelayCapacity sized off this engine's one (fixed) latency: the dry path writes
+    // an entire block and reads it back in a second pass, so the ring must hold at
+    // least one full block on top of the latency, or a large block wraps around and
+    // clobbers samples before they're ever read.
+    dryDelayCapacity = totalLatencyBaseSamples + juce::jmax(1, maxBlockSize) + 64;
 
     // Rounded up to a power of two so every ring index below is a single AND against
-    // tp8xPeakRingMask instead of an integer division: this ring is indexed twice per
+    // tpGainPeakRingMask instead of an integer division: this ring is indexed twice per
     // dedicated-oversampled tick (write once per block, read once per main loop tick),
-    // so at 192kHz/8x that is tens of thousands of indexing operations per second per
-    // channel -- measured to be a significant, avoidable share of this analyzer's CPU
-    // cost with a non-power-of-two modulus.
-    const int gainFactorForRing = 1 << kDedicatedTpGainStages;
-    const int minRingCapacityNeeded = dryDelayCapacity * gainFactorForRing;
-    tp8xPeakRingCapacity = 1;
-    while (tp8xPeakRingCapacity < minRingCapacityNeeded) tp8xPeakRingCapacity <<= 1;
-    tp8xPeakRingMask = tp8xPeakRingCapacity - 1;
+    // so at high sample rates that is tens of thousands of indexing operations per
+    // second per channel -- measured to be a significant, avoidable share of this
+    // analyzer's CPU cost with a non-power-of-two modulus.
+    const int minRingCapacityNeeded = dryDelayCapacity * tpFactor;
+    tpGainPeakRingCapacity = 1;
+    while (tpGainPeakRingCapacity < minRingCapacityNeeded) tpGainPeakRingCapacity <<= 1;
+    tpGainPeakRingMask = tpGainPeakRingCapacity - 1;
 
     for (auto& cs : channelState)
     {
         cs.dryBaseDelay.assign((size_t) dryDelayCapacity, 0.0f);
-        cs.tp8xPeakRing.assign((size_t) tp8xPeakRingCapacity, 0.0f);
-        for (auto& p : cs.path)
-        {
-            p.delay.assign((size_t) delayCapacity, 0.0f);
-            p.minIdxRing.assign((size_t) minRingCapacity, (juce::int64) 0);
-            p.minValRing.assign((size_t) minRingCapacity, 0.0f);
-            p.paddingRing.assign((size_t) paddingRingCapacity, 0.0f);
-            p.minHead = 0; p.minCount = 0; p.currentGain = 1.0f; p.heldDigitalPeak = 0.0f;
-        }
+        cs.tpGainPeakRing.assign((size_t) tpGainPeakRingCapacity, 0.0f);
+        cs.path.delay.assign((size_t) delayCapacity, 0.0f);
+        cs.path.minIdxRing.assign((size_t) minRingCapacity, (juce::int64) 0);
+        cs.path.minValRing.assign((size_t) minRingCapacity, 0.0f);
+        cs.path.minHead = 0; cs.path.minCount = 0; cs.path.currentGain = 1.0f; cs.path.heldDigitalPeak = 0.0f;
     }
-    for (auto& b : pathScratch) b.setSize(numChannels, juce::jmax(1, maximumBlockSize), false, false, true);
-    for (auto& b : pathOut) b.setSize(numChannels, juce::jmax(1, maximumBlockSize), false, false, true);
-
-    const int wanted = juce::jlimit(1, 8, pendingOsFactor.load());
-    pendingOsFactor.store(wanted);
-    activePathFactor.store(wanted);
-    activePathIdx = 0;
-    warmingPathIdx = -1;
-    crossfadeActive = false;
-    crossfadeSamplesDone = 0;
-    // A short, fixed crossfade -- a few ms is enough to be inaudible as a transition
-    // while staying short relative to the lookahead warm-up time it follows.
-    crossfadeTotalSamples = juce::jmax(1, (int) std::round(baseSampleRate * 0.005));
-
-    for (int p = 0; p < kNumPaths; ++p)
-    {
-        pathTiming[(size_t) p] = PathTiming{};
-        pathTiming[(size_t) p].factor = wanted;
-        pathTiming[(size_t) p].paddingSamples = paddingSamplesForFactor[(size_t) factorToIndex(wanted)];
-    }
-    pathTiming[(size_t) activePathIdx].inUse = true;
+    pathScratch.setSize(numChannels, juce::jmax(1, maximumBlockSize), false, false, true);
 
     inputGainSmoothed.reset(baseSampleRate, 0.02);
     ceilingSmoothed.reset(baseSampleRate, 0.02);
@@ -188,62 +147,20 @@ void LimiterEngine::prepare(double sampleRate, int maximumBlockSize, int newNumC
 void LimiterEngine::reset()
 {
     baseWritePos = 0;
-    warmingPathIdx = -1;
-    crossfadeActive = false;
-    crossfadeSamplesDone = 0;
-    const int wanted = juce::jlimit(1, 8, pendingOsFactor.load());
-    activePathIdx = 0;
-    activePathFactor.store(wanted);
-
-    for (int p = 0; p < kNumPaths; ++p)
-    {
-        auto& pt = pathTiming[(size_t) p];
-        pt.writePos = 0; pt.readPos = 0; pt.baseSamplesIngested = 0; pt.paddingWritePos = 0;
-        pt.factor = wanted;
-        pt.paddingSamples = paddingSamplesForFactor[(size_t) factorToIndex(wanted)];
-        pt.inUse = (p == activePathIdx);
-    }
+    writePos = 0;
+    readPos = 0;
 
     for (auto& cs : channelState)
     {
         std::fill(cs.dryBaseDelay.begin(), cs.dryBaseDelay.end(), 0.0f);
-        std::fill(cs.tp8xPeakRing.begin(), cs.tp8xPeakRing.end(), 0.0f);
-        for (auto& p : cs.path)
-        {
-            std::fill(p.delay.begin(), p.delay.end(), 0.0f);
-            std::fill(p.paddingRing.begin(), p.paddingRing.end(), 0.0f);
-            p.minHead = 0; p.minCount = 0; p.currentGain = 1.0f; p.heldDigitalPeak = 0.0f;
-        }
+        std::fill(cs.tpGainPeakRing.begin(), cs.tpGainPeakRing.end(), 0.0f);
+        std::fill(cs.path.delay.begin(), cs.path.delay.end(), 0.0f);
+        cs.path.minHead = 0; cs.path.minCount = 0; cs.path.currentGain = 1.0f; cs.path.heldDigitalPeak = 0.0f;
     }
-    for (auto& os : oversamplers) if (os) os->reset();
+    if (oversampler) oversampler->reset();
     if (dedicatedTpOversampler) dedicatedTpOversampler->reset();
     if (dedicatedTpGainOversampler) dedicatedTpGainOversampler->reset();
     currentGrDb.store(0.0f);
-}
-
-void LimiterEngine::startWarmup(int newFactor)
-{
-    warmingPathIdx = 1 - activePathIdx;
-    auto& wt = pathTiming[(size_t) warmingPathIdx];
-    wt.writePos = 0; wt.readPos = 0; wt.baseSamplesIngested = 0; wt.paddingWritePos = 0;
-    wt.factor = newFactor;
-    wt.paddingSamples = paddingSamplesForFactor[(size_t) factorToIndex(newFactor)];
-    wt.inUse = true;
-    crossfadeActive = false;
-    crossfadeSamplesDone = 0;
-
-    for (auto& cs : channelState)
-    {
-        auto& ps = cs.path[(size_t) warmingPathIdx];
-        std::fill(ps.delay.begin(), ps.delay.end(), 0.0f);
-        std::fill(ps.paddingRing.begin(), ps.paddingRing.end(), 0.0f);
-        ps.minHead = 0; ps.minCount = 0; ps.currentGain = 1.0f; ps.heldDigitalPeak = 0.0f;
-    }
-    // Safe to reset this factor's own oversampler: it cannot currently be feeding the
-    // active path (the active path's own factor is different, or this path would not
-    // be warming), so no audio in flight through it is disturbed.
-    const int idx = factorToIndex(newFactor);
-    if (oversamplers[(size_t) idx]) oversamplers[(size_t) idx]->reset();
 }
 
 void LimiterEngine::setParameters(float inputGainDb, float ceilingDbTP, float releaseMsIn, bool autoReleaseIn,
@@ -340,239 +257,15 @@ void LimiterEngine::popExpiredMin(PathState& ps, juce::int64 minAllowedIdx, int 
     }
 }
 
-float LimiterEngine::runPath(PathTiming& timing, int pathIdx, const juce::AudioBuffer<float>& rawInput,
-                              juce::AudioBuffer<float>& outWet, int chans, int numBaseSamples,
-                              const float* gainRamp, const float* ceilRamp, const float* linkRamp, const float* tpBlendRamp)
-{
-    const int factor = timing.factor;
-    const int idx = factorToIndex(factor);
-    // truePeakEnabled is included (not just the ramp values) because activation now
-    // uses the analyzer's candidate at full strength from the very first tick (see the
-    // max-combination below) rather than fading it in with tpBlendRamp -- so the ring
-    // must be consulted from that same first tick, even in the edge case where this
-    // whole block's tpBlendRamp values happen to still read as ~0.
-    const bool needsTpGainAnalysis = truePeakEnabled || tpBlendRamp[0] > 1.0e-6f || tpBlendRamp[numBaseSamples - 1] > 1.0e-6f;
-
-    auto& scratch = pathScratch[(size_t) pathIdx];
-    for (int ch = 0; ch < chans; ++ch)
-        scratch.copyFrom(ch, 0, rawInput, ch, 0, numBaseSamples);
-
-    juce::dsp::AudioBlock<float> block(scratch.getArrayOfWritePointers(), (size_t) chans, (size_t) numBaseSamples);
-    juce::dsp::AudioBlock<float> osBlock = block;
-    if (factor > 1 && oversamplers[(size_t) idx] != nullptr)
-        osBlock = oversamplers[(size_t) idx]->processSamplesUp(block);
-
-    const int osNumSamples = (int) osBlock.getNumSamples();
-    const int lookaheadOs = lookaheadOsSamples[(size_t) idx];
-    const double osSampleRate = baseSampleRate * (double) factor;
-    float minGainThisBlock = 1.0f;
-
-    for (int i = 0; i < osNumSamples; ++i)
-    {
-        const int nBase = i / factor;
-        const float gainNow = gainRamp[nBase];
-        const float ceilNow = ceilRamp[nBase];
-        const float linkNow = linkRamp[nBase];
-        const float tpBlendNow = tpBlendRamp[nBase];
-
-        float peak[2] { 0.0f, 0.0f };
-        for (int ch = 0; ch < chans; ++ch)
-        {
-            auto& ps = channelState[(size_t) ch].path[(size_t) pathIdx];
-            float xRaw = osBlock.getChannelPointer((size_t) ch)[i];
-            if (! std::isfinite(xRaw)) xRaw = 0.0f;
-
-            // Gain is applied exactly once, right here, only for the wet (limited) path.
-            const float xGained = xRaw * gainNow;
-            ps.delay[(size_t) (timing.writePos % delayCapacity)] = xGained;
-
-            const float instantAbs = std::abs(xGained);
-            if ((timing.writePos % factor) == 0) ps.heldDigitalPeak = instantAbs;
-
-            // The True-Peak-on candidate comes from the dedicated, fixed-8x,
-            // feed-forward analyzer (decoupled from `factor`, and SHARED between both
-            // paths -- it never needs duplicating since its own precision never depends
-            // on which path/factor is reading it) rather than this path's own
-            // `instantAbs`. `factor` always evenly divides kGainAnalysisFactor (1/2/4/8
-            // divide 8), so each of this base sample's `factor` ticks maps onto its own
-            // equal-sized slice of the analyzer's 8 sub-samples for that base sample.
-            float tpOnCandidate = instantAbs;
-            if (needsTpGainAnalysis)
-            {
-                const int iWithinBase = i - nBase * factor;
-                const int subPerTick = kGainAnalysisFactor / factor;
-                const juce::int64 baseOsIdx = (baseWritePos + nBase) * kGainAnalysisFactor
-                                             + iWithinBase * subPerTick - dedicatedTpGainLatencyOsSamples;
-                // During the analyzer's own warm-up (the first ~39 base samples after
-                // prepare()/reset(), before the delay-compensated ring position becomes
-                // valid), baseOsIdx is negative: fall back to instantAbs rather than
-                // 0.0f, which would silently zero the True-Peak-on candidate for that
-                // window (with truePeakBlend at 1.0, that would suppress real,
-                // legitimate cold-start gain reduction).
-                float m = instantAbs;
-                if (baseOsIdx >= 0)
-                {
-                    auto& sharedRing = channelState[(size_t) ch].tp8xPeakRing;
-                    m = 0.0f;
-                    for (int k = 0; k < subPerTick; ++k)
-                        m = juce::jmax(m, sharedRing[(size_t) ((baseOsIdx + k) & tp8xPeakRingMask)]);
-                }
-                tpOnCandidate = m;
-            }
-            // Asymmetric by design (activating vs releasing protection are not the same
-            // risk): a plain linear blend of the two detectors during ACTIVATION can
-            // authorize LESS gain reduction than either detector alone would demand
-            // whenever tpOnCandidate > heldDigitalPeak (the normal case, since real
-            // intersample peaks usually exceed the plain sample peak) -- for any
-            // tpBlendNow in (0,1) that produces a candidate strictly between the two,
-            // under-protecting relative to the true peak for the whole ~20ms ramp.
-            // Measured: this was the actual cause of a real overshoot (up to ~1.4dB)
-            // whenever a factor switch's warm-up happened to land during that ramp.
-            // Fix: while True Peak is enabled (ramping up OR already fully on), use the
-            // MAX of the two detectors -- a monotonically-safe combination that can
-            // never be smaller than either input, so it never authorizes less
-            // protection than either alone would. This deliberately ignores the blend
-            // ramp for the decision itself (protection engages at full strength the
-            // instant the toggle flips ON); audible smoothness still comes from the
-            // existing lookahead window and release envelope, exactly as for any other
-            // ordinary change in program peak -- no separate ramp is needed for that.
-            // While True Peak is disabled (ramping down toward OFF), the plain linear
-            // blend remains: giving up protection gradually is inherently safe (it can
-            // only ever move the target toward "less limiting", never past the ceiling
-            // it was already meeting), so there is no monotonic-safety requirement on
-            // that direction, and easing off gradually avoids a level/character jump
-            // right at the moment the toggle flips OFF.
-            peak[ch] = truePeakEnabled
-                ? juce::jmax(ps.heldDigitalPeak, tpOnCandidate)
-                : (ps.heldDigitalPeak + tpBlendNow * (tpOnCandidate - ps.heldDigitalPeak));
-        }
-
-        // Stereo Link interpolates in the dB gain-reduction domain, not the linear peak
-        // domain: each channel first gets its own fully-independent target, then (for
-        // true stereo material) the two are blended toward whichever needs the larger
-        // reduction. Blending dB values — not peaks — before converting back to a linear
-        // gain is what keeps the link curve perceptually linear across 0-100%, and it's
-        // mono-safe by construction.
-        float independentGrDb[2] { 0.0f, 0.0f };
-        for (int ch = 0; ch < chans; ++ch)
-        {
-            const float independentTarget = (peak[ch] > ceilNow && peak[ch] > 1.0e-9f) ? ceilNow / peak[ch] : 1.0f;
-            independentGrDb[ch] = juce::Decibels::gainToDecibels(juce::jlimit(0.0f, 1.0f, independentTarget), -100.0f);
-        }
-        const float linkedGrDb = chans > 1 ? juce::jmin(independentGrDb[0], independentGrDb[1]) : independentGrDb[0];
-
-        for (int ch = 0; ch < chans; ++ch)
-        {
-            auto& ps = channelState[(size_t) ch].path[(size_t) pathIdx];
-            const float finalGrDb = juce::jmap(linkNow, independentGrDb[ch], linkedGrDb);
-            float target = bypassed ? 1.0f : juce::Decibels::decibelsToGain(finalGrDb, -100.0f);
-            target = juce::jlimit(0.0f, 1.0f, target);
-            pushMin(ps, timing.writePos, target, minRingCapacity);
-        }
-
-        ++timing.writePos;
-
-        if (timing.writePos - timing.readPos > lookaheadOs)
-        {
-            for (int ch = 0; ch < chans; ++ch)
-            {
-                auto& ps = channelState[(size_t) ch].path[(size_t) pathIdx];
-                popExpiredMin(ps, timing.readPos, minRingCapacity);
-                const float windowMin = ps.minCount > 0 ? ps.minValRing[(size_t) ps.minHead] : 1.0f;
-
-                if (bypassed)
-                    ps.currentGain = 1.0f;
-                else if (windowMin < ps.currentGain)
-                    ps.currentGain = windowMin; // instant foresight-based attack (already ramped by the window)
-                else
-                    ps.currentGain = windowMin + computeReleaseCoeff(windowMin, osSampleRate) * (ps.currentGain - windowMin);
-
-                float wet = ps.delay[(size_t) (timing.readPos % delayCapacity)] * ps.currentGain;
-                applyCharacter(wet);
-                // Last-resort safety net against decimation-filter ringing overshoot —
-                // only meaningful when the gain computer is actually targeting this same
-                // oversampled ceiling, i.e. True Peak is on. With it off, gain reduction
-                // is deliberately driven by the decimated sample peak alone, so the true
-                // (oversampled) peak is *expected* to run past the ceiling; clamping it
-                // here would silently distort the signal and hide that legitimate
-                // overshoot from both the ear and the meter.
-                const float clampedWet = juce::jlimit(-ceilNow, ceilNow, wet);
-                // Same asymmetry as the peak-candidate decision above: while activating,
-                // this residual clamp engages at full strength immediately rather than
-                // fading in over the blend ramp, since the gain computer above is
-                // already fully protecting from this same instant (via the `max`
-                // combination) -- leaving this last-resort net blended in more slowly
-                // would reopen exactly the gap the peak-candidate fix just closed for
-                // whatever fraction of overshoot the gain computer doesn't already
-                // catch (decimation-filter ringing). While deactivating, it still fades
-                // out with tpBlendNow, matching the gradual release of protection above.
-                const float clampBlend = truePeakEnabled ? 1.0f : tpBlendNow;
-                wet += clampBlend * (clampedWet - wet);
-                osBlock.getChannelPointer((size_t) ch)[i] = wet;
-
-                minGainThisBlock = juce::jmin(minGainThisBlock, ps.currentGain);
-            }
-            ++timing.readPos;
-        }
-        else
-        {
-            for (int ch = 0; ch < chans; ++ch)
-                osBlock.getChannelPointer((size_t) ch)[i] = 0.0f;
-        }
-    }
-
-    if (factor > 1 && oversamplers[(size_t) idx] != nullptr)
-        oversamplers[(size_t) idx]->processSamplesDown(block);
-
-    // Internal fixed-latency padding: a pure per-channel delay of
-    // timing.paddingSamples base-rate samples, so this path's TOTAL physical latency
-    // (lookahead + this factor's own filter latency + this padding) always equals
-    // fixedLatencyBaseSamples, regardless of which factor is running. This is what
-    // makes a same-instant crossfade between two different-factor paths valid: both
-    // describe the exact same moment in the original input.
-    for (int ch = 0; ch < chans; ++ch)
-    {
-        auto& ps = channelState[(size_t) ch].path[(size_t) pathIdx];
-        auto* d = scratch.getWritePointer(ch);
-        for (int n = 0; n < numBaseSamples; ++n)
-        {
-            const juce::int64 wp = timing.paddingWritePos + n;
-            ps.paddingRing[(size_t) (wp % paddingRingCapacity)] = d[n];
-            const juce::int64 rp = wp - timing.paddingSamples;
-            outWet.setSample(ch, n, rp >= 0 ? ps.paddingRing[(size_t) (rp % paddingRingCapacity)] : 0.0f);
-        }
-    }
-    timing.paddingWritePos += numBaseSamples;
-    timing.baseSamplesIngested += numBaseSamples;
-
-    return minGainThisBlock;
-}
-
 void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
 {
     const int chans = juce::jmin(numChannels, buffer.getNumChannels());
     const int numBaseSamples = buffer.getNumSamples();
 
-    // Start (or redirect) a warm-up if the target factor has changed. A crossfade
-    // already in progress is never interrupted -- the newest request is picked up the
-    // instant that crossfade completes and warmingPathIdx returns to -1.
-    const int wanted = juce::jlimit(1, 8, pendingOsFactor.load());
-    if (warmingPathIdx < 0)
-    {
-        if (wanted != pathTiming[(size_t) activePathIdx].factor)
-            startWarmup(wanted);
-    }
-    else if (! crossfadeActive && wanted != pathTiming[(size_t) warmingPathIdx].factor)
-    {
-        startWarmup(wanted);
-    }
-
     // Capture the untouched dry signal at the BASE rate, before oversampling even
-    // begins — a pure sample delay that never runs through the oversampling filters,
-    // so bypass is bit-exact (not just gain/limiter-free). It will be read back
+    // begins — a pure sample delay that never runs through the oversampling filter, so
+    // bypass is bit-exact (not just gain/limiter-free). It will be read back
     // latencySamples() behind the input, so it lands in perfect sync with the wet path.
-    // baseWritePos is global and factor-independent (latency is fixed), so it is never
-    // reset by a factor switch -- bypass alignment stays perfectly continuous through one.
     for (int ch = 0; ch < chans; ++ch)
     {
         auto& cs = channelState[(size_t) ch];
@@ -585,11 +278,8 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
         }
     }
 
-    // Shared, per-base-sample parameter ramps: read by BOTH paths' per-tick loops (each
-    // repeats the same base-sample value across its own `factor` sub-ticks). These tick
-    // at the base rate unconditionally now (never per oversampled tick, and never reset
-    // by a factor switch) specifically so two paths running at different factors during
-    // a crossfade can't desync a shared SmoothedValue by consuming it at different rates.
+    // Shared, per-base-sample parameter ramps, read by the per-tick loop below (which
+    // repeats the same base-sample value across its own `dspFactor` sub-ticks).
     for (int n = 0; n < numBaseSamples; ++n)
     {
         inputGainRampScratch[(size_t) n] = inputGainSmoothed.getNextValue();
@@ -598,19 +288,16 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
         tpBlendRampScratch[(size_t) n] = truePeakBlend.getNextValue();
     }
 
-    // Dedicated True Peak GAIN-DRIVING analysis: fixed 8x, feed-forward, decoupled from
-    // the OVERSAMPLING selector's own factor -- shared, unduplicated, between both
-    // paths. Runs UNCONDITIONALLY, whether True Peak is on, off, or mid-transition:
-    // this ring is read `dedicatedTpGainLatencyOsSamples` sub-samples in the past by
-    // runPath(), so if it were only written while True Peak is (or was about to be)
-    // on, re-enabling it after any OFF period would read back stale data left over
-    // from the last time it ran (or silence, if it never ran) for a short window right
-    // after activation -- a real, measured protection gap at the exact moment True
-    // Peak turns on, independent of and in addition to the blend-ramp issue fixed
-    // below. Running it continuously means the ring is always caught up to "now minus
-    // the analyzer's own latency", so there is never a stale-data window to read from,
-    // at the cost of always paying this analyzer's own CPU (measured separately in the
-    // benchmark) even while True Peak is fully off.
+    // Dedicated True Peak GAIN-DRIVING analysis: feed-forward, decoupled from the DSP
+    // oversampler's own factor. Runs UNCONDITIONALLY, whether True Peak is on, off, or
+    // mid-transition: this ring is read `dedicatedTpGainLatencyOsSamples` sub-samples
+    // in the past below, so if it only ran while True Peak was on, re-enabling it after
+    // any OFF period would read back stale data left over from the last time it ran (or
+    // silence, if it never ran) for a short window right after activation -- a real,
+    // measured protection gap at the exact moment True Peak turns on. Running it
+    // continuously means the ring is always caught up to "now minus the analyzer's own
+    // latency", at the cost of always paying this analyzer's own CPU (measured
+    // separately in the benchmark) even while True Peak is fully off.
     {
         for (int ch = 0; ch < chans; ++ch)
         {
@@ -632,112 +319,181 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
         {
             auto& cs = channelState[(size_t) ch];
             auto* up = gainOs.getChannelPointer((size_t) ch);
-            const juce::int64 baseOsIdx = baseWritePos * kGainAnalysisFactor;
+            const juce::int64 baseOsIdx = baseWritePos * tpFactor;
             for (size_t k = 0; k < gainOs.getNumSamples(); ++k)
             {
                 float v = std::abs(up[k]);
                 if (! std::isfinite(v)) v = 0.0f;
-                cs.tp8xPeakRing[(size_t) ((baseOsIdx + (juce::int64) k) & tp8xPeakRingMask)] = v;
+                cs.tpGainPeakRing[(size_t) ((baseOsIdx + (juce::int64) k) & tpGainPeakRingMask)] = v;
             }
         }
     }
 
-    // Run the active path (always fully protected, never reset mid-stream) and, if a
-    // switch is in flight, the warming path in parallel -- both fed the same input.
-    const float activeMinGain = runPath(pathTiming[(size_t) activePathIdx], activePathIdx, buffer,
-                                         pathOut[(size_t) activePathIdx], chans, numBaseSamples,
-                                         inputGainRampScratch.data(), ceilRampScratch.data(),
-                                         linkRampScratch.data(), tpBlendRampScratch.data());
-    float warmMinGain = 1.0f;
-    // Local sample index, WITHIN this block, at which the warm path first becomes
-    // ready to crossfade -- numBaseSamples (i.e. "not this block") unless it is
-    // computed below. This must be exact to the sample, not just "ready somewhere in
-    // this block": checking readiness only once per process() CALL (after running the
-    // whole block) would let a large block start blending in a warm path that had not
-    // actually finished warming yet for that same block's EARLIER samples -- a real,
-    // block-size-DEPENDENT protection gap (confirmed: this was the exact cause of a
-    // measured ~3.4dB overshoot and a null-test/block-invariance failure before this
-    // fix). Comparing baseSamplesIngested from before vs after this call, and computed
-    // once per process() call, is entirely equivalent to checking every sample: the
-    // count only ever advances by whole samples, in order, so the exact threshold
-    // sample is recoverable without a per-sample loop.
-    int warmReadySampleIdx = numBaseSamples;
-    if (warmingPathIdx >= 0)
+    // truePeakEnabled is included (not just the ramp values) because activation uses
+    // the analyzer's candidate at full strength from the very first tick (see the
+    // max-combination below) rather than fading it in with tpBlendRamp -- so the ring
+    // must be consulted from that same first tick, even in the edge case where this
+    // whole block's tpBlendRamp values happen to still read as ~0.
+    const bool needsTpGainAnalysis = truePeakEnabled || tpBlendRampScratch[0] > 1.0e-6f
+                                    || tpBlendRampScratch[(size_t) numBaseSamples - 1] > 1.0e-6f;
+
+    for (int ch = 0; ch < chans; ++ch)
+        pathScratch.copyFrom(ch, 0, buffer, ch, 0, numBaseSamples);
+
+    juce::dsp::AudioBlock<float> block(pathScratch.getArrayOfWritePointers(), (size_t) chans, (size_t) numBaseSamples);
+    juce::dsp::AudioBlock<float> osBlock = block;
+    if (dspFactor > 1 && oversampler != nullptr)
+        osBlock = oversampler->processSamplesUp(block);
+
+    const int osNumSamples = (int) osBlock.getNumSamples();
+    const double osSampleRate = baseSampleRate * (double) dspFactor;
+    float minGainThisBlock = 1.0f;
+
+    for (int i = 0; i < osNumSamples; ++i)
     {
-        const juce::int64 ingestedBefore = pathTiming[(size_t) warmingPathIdx].baseSamplesIngested;
-        warmMinGain = runPath(pathTiming[(size_t) warmingPathIdx], warmingPathIdx, buffer,
-                               pathOut[(size_t) warmingPathIdx], chans, numBaseSamples,
-                               inputGainRampScratch.data(), ceilRampScratch.data(),
-                               linkRampScratch.data(), tpBlendRampScratch.data());
-        // The warm path becomes eligible for crossfade once its own lookahead window is
-        // populated ENTIRELY with decisions made after any shared parameter ramp
-        // (inputGainSmoothed, ceilingSmoothed, stereoLinkSmoothed, truePeakBlend) has
-        // fully settled -- not merely once the ramp has settled. The min-window only
-        // ever remembers the last lookaheadBaseSamples-worth of pushed decisions
-        // (older ones are continuously popped as the window slides); waiting for just
-        // rampSettleBaseSamples ingested samples still leaves the window's own content
-        // partly built from ticks where the ramp was mid-transition, since the last
-        // ramp tick and the readiness check would land in the same instant. Requiring
-        // the ramp to settle AND THEN a full additional lookahead to elapse guarantees
-        // every entry remaining in the window was pushed after the ramp already
-        // reached its target (measured: this two-stage margin was needed -- summing
-        // the two, not just taking their max, eliminated a real, reproducible overshoot
-        // when a factor switch and a True Peak toggle land at the same moment; pure
-        // factor switching alone was already correct with no extra margin at all).
-        const juce::int64 readyThreshold = rampSettleBaseSamples + lookaheadBaseSamples + 1;
-        if (! crossfadeActive)
+        const int nBase = i / dspFactor;
+        const float gainNow = inputGainRampScratch[(size_t) nBase];
+        const float ceilNow = ceilRampScratch[(size_t) nBase];
+        const float linkNow = linkRampScratch[(size_t) nBase];
+        const float tpBlendNow = tpBlendRampScratch[(size_t) nBase];
+
+        float peak[2] { 0.0f, 0.0f };
+        for (int ch = 0; ch < chans; ++ch)
         {
-            const juce::int64 ingestedAfter = pathTiming[(size_t) warmingPathIdx].baseSamplesIngested;
-            if (ingestedAfter >= readyThreshold)
-                warmReadySampleIdx = (int) juce::jmax((juce::int64) 0, readyThreshold - ingestedBefore);
+            auto& ps = channelState[(size_t) ch].path;
+            float xRaw = osBlock.getChannelPointer((size_t) ch)[i];
+            if (! std::isfinite(xRaw)) xRaw = 0.0f;
+
+            // Gain is applied exactly once, right here, only for the wet (limited) path.
+            const float xGained = xRaw * gainNow;
+            ps.delay[(size_t) (writePos % delayCapacity)] = xGained;
+
+            const float instantAbs = std::abs(xGained);
+            if ((writePos % dspFactor) == 0) ps.heldDigitalPeak = instantAbs;
+
+            // The True-Peak-on candidate comes from the dedicated feed-forward analyzer
+            // (decoupled from dspFactor) rather than this path's own `instantAbs`.
+            // dspFactor always evenly divides tpFactor (see tierForSampleRate: 4|8,
+            // 2|4, 1|2), so each of this base sample's dspFactor ticks maps onto its
+            // own equal-sized slice of the analyzer's tpFactor sub-samples for that
+            // base sample.
+            float tpOnCandidate = instantAbs;
+            if (needsTpGainAnalysis)
+            {
+                const int iWithinBase = i - nBase * dspFactor;
+                const int subPerTick = tpFactor / dspFactor;
+                const juce::int64 baseOsIdx = (baseWritePos + nBase) * tpFactor
+                                             + iWithinBase * subPerTick - dedicatedTpGainLatencyOsSamples;
+                // During the analyzer's own warm-up (the first few base samples after
+                // prepare()/reset(), before the delay-compensated ring position becomes
+                // valid), baseOsIdx is negative: fall back to instantAbs rather than
+                // 0.0f, which would silently zero the True-Peak-on candidate for that
+                // window (with truePeakBlend at 1.0, that would suppress real,
+                // legitimate cold-start gain reduction).
+                float m = instantAbs;
+                if (baseOsIdx >= 0)
+                {
+                    auto& sharedRing = channelState[(size_t) ch].tpGainPeakRing;
+                    m = 0.0f;
+                    for (int k = 0; k < subPerTick; ++k)
+                        m = juce::jmax(m, sharedRing[(size_t) ((baseOsIdx + k) & tpGainPeakRingMask)]);
+                }
+                tpOnCandidate = m;
+            }
+            // Asymmetric by design (activating vs releasing protection are not the same
+            // risk): a plain linear blend of the two detectors during ACTIVATION can
+            // authorize LESS gain reduction than either detector alone would demand
+            // whenever tpOnCandidate > heldDigitalPeak (the normal case, since real
+            // intersample peaks usually exceed the plain sample peak) -- for any
+            // tpBlendNow in (0,1) that produces a candidate strictly between the two,
+            // under-protecting relative to the true peak for the whole ~20ms ramp.
+            // Fix: while True Peak is enabled (ramping up OR already fully on), use the
+            // MAX of the two detectors -- a monotonically-safe combination that can
+            // never be smaller than either input, so it never authorizes less
+            // protection than either alone would. This deliberately ignores the blend
+            // ramp for the decision itself (protection engages at full strength the
+            // instant the toggle flips ON); audible smoothness still comes from the
+            // existing lookahead window and release envelope, exactly as for any other
+            // ordinary change in program peak -- no separate ramp is needed for that.
+            // While True Peak is disabled (ramping down toward OFF), the plain linear
+            // blend remains: giving up protection gradually is inherently safe.
+            peak[ch] = truePeakEnabled
+                ? juce::jmax(ps.heldDigitalPeak, tpOnCandidate)
+                : (ps.heldDigitalPeak + tpBlendNow * (tpOnCandidate - ps.heldDigitalPeak));
+        }
+
+        // Stereo Link interpolates in the dB gain-reduction domain, not the linear peak
+        // domain: each channel first gets its own fully-independent target, then (for
+        // true stereo material) the two are blended toward whichever needs the larger
+        // reduction. Blending dB values — not peaks — before converting back to a linear
+        // gain is what keeps the link curve perceptually linear across 0-100%, and it's
+        // mono-safe by construction.
+        float independentGrDb[2] { 0.0f, 0.0f };
+        for (int ch = 0; ch < chans; ++ch)
+        {
+            const float independentTarget = (peak[ch] > ceilNow && peak[ch] > 1.0e-9f) ? ceilNow / peak[ch] : 1.0f;
+            independentGrDb[ch] = juce::Decibels::gainToDecibels(juce::jlimit(0.0f, 1.0f, independentTarget), -100.0f);
+        }
+        const float linkedGrDb = chans > 1 ? juce::jmin(independentGrDb[0], independentGrDb[1]) : independentGrDb[0];
+
+        for (int ch = 0; ch < chans; ++ch)
+        {
+            auto& ps = channelState[(size_t) ch].path;
+            const float finalGrDb = juce::jmap(linkNow, independentGrDb[ch], linkedGrDb);
+            float target = bypassed ? 1.0f : juce::Decibels::decibelsToGain(finalGrDb, -100.0f);
+            target = juce::jlimit(0.0f, 1.0f, target);
+            pushMin(ps, writePos, target, minRingCapacity);
+        }
+
+        ++writePos;
+
+        if (writePos - readPos > lookaheadOsSamples)
+        {
+            for (int ch = 0; ch < chans; ++ch)
+            {
+                auto& ps = channelState[(size_t) ch].path;
+                popExpiredMin(ps, readPos, minRingCapacity);
+                const float windowMin = ps.minCount > 0 ? ps.minValRing[(size_t) ps.minHead] : 1.0f;
+
+                if (bypassed)
+                    ps.currentGain = 1.0f;
+                else if (windowMin < ps.currentGain)
+                    ps.currentGain = windowMin; // instant foresight-based attack (already ramped by the window)
+                else
+                    ps.currentGain = windowMin + computeReleaseCoeff(windowMin, osSampleRate) * (ps.currentGain - windowMin);
+
+                float wet = ps.delay[(size_t) (readPos % delayCapacity)] * ps.currentGain;
+                applyCharacter(wet);
+                // Last-resort safety net against decimation-filter ringing overshoot —
+                // only meaningful when the gain computer is actually targeting this same
+                // oversampled ceiling, i.e. True Peak is on. With it off, gain reduction
+                // is deliberately driven by the decimated sample peak alone, so the true
+                // (oversampled) peak is *expected* to run past the ceiling; clamping it
+                // here would silently distort the signal and hide that legitimate
+                // overshoot from both the ear and the meter.
+                const float clampedWet = juce::jlimit(-ceilNow, ceilNow, wet);
+                // Same asymmetry as the peak-candidate decision above: while activating,
+                // this residual clamp engages at full strength immediately.
+                const float clampBlend = truePeakEnabled ? 1.0f : tpBlendNow;
+                wet += clampBlend * (clampedWet - wet);
+                osBlock.getChannelPointer((size_t) ch)[i] = wet;
+
+                minGainThisBlock = juce::jmin(minGainThisBlock, ps.currentGain);
+            }
+            ++readPos;
         }
         else
         {
-            warmReadySampleIdx = 0; // already running, ready from the start of this block
+            for (int ch = 0; ch < chans; ++ch)
+                osBlock.getChannelPointer((size_t) ch)[i] = 0.0f;
         }
     }
 
-    // Combine active + warm output into the actual output buffer, per base sample.
-    // Raised-cosine COMPLEMENTARY weights (oldGain + newGain == 1.0 exactly, monotonic,
-    // no equal-power centre bump): for two highly-correlated signal versions, a linear
-    // combination with weights summing to 1 can never exceed the larger of the two
-    // inputs' magnitude at any instant (triangle inequality), so this step cannot itself
-    // create a new true peak, unlike an equal-power (sin/cos, sum-of-squares = 1) curve.
-    bool crossfadeFinishedThisBlock = false;
-    for (int n = 0; n < numBaseSamples; ++n)
-    {
-        float oldW = 1.0f, newW = 0.0f;
-        if (! crossfadeActive && n >= warmReadySampleIdx)
-        {
-            crossfadeActive = true;
-            crossfadeSamplesDone = 0;
-        }
-        if (crossfadeActive)
-        {
-            const float t = juce::jlimit(0.0f, 1.0f, (float) crossfadeSamplesDone / (float) crossfadeTotalSamples);
-            oldW = 0.5f * (1.0f + std::cos(juce::MathConstants<float>::pi * t));
-            newW = 1.0f - oldW;
-            ++crossfadeSamplesDone;
-            if (crossfadeSamplesDone >= crossfadeTotalSamples) crossfadeFinishedThisBlock = true;
-        }
-        for (int ch = 0; ch < chans; ++ch)
-        {
-            const float activeSample = pathOut[(size_t) activePathIdx].getSample(ch, n);
-            const float warmSample = warmingPathIdx >= 0 ? pathOut[(size_t) warmingPathIdx].getSample(ch, n) : 0.0f;
-            buffer.setSample(ch, n, oldW * activeSample + newW * warmSample);
-        }
-    }
-    const float minGainThisBlock = crossfadeActive ? juce::jmin(activeMinGain, warmMinGain) : activeMinGain;
+    if (dspFactor > 1 && oversampler != nullptr)
+        oversampler->processSamplesDown(block);
 
-    if (crossfadeFinishedThisBlock)
-    {
-        pathTiming[(size_t) activePathIdx].inUse = false;
-        activePathIdx = warmingPathIdx;
-        warmingPathIdx = -1;
-        crossfadeActive = false;
-        crossfadeSamplesDone = 0;
-        activePathFactor.store(pathTiming[(size_t) activePathIdx].factor);
-    }
+    for (int ch = 0; ch < chans; ++ch)
+        buffer.copyFrom(ch, 0, pathScratch, ch, 0, numBaseSamples);
 
     // Final safety net: the gain computer above guarantees the ceiling in the
     // oversampled domain, but the decimation (anti-imaging) filter used to get back to
@@ -761,18 +517,16 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
 
     // Dry/wet crossfade happens here, at the base rate, after the wet path has been
     // fully computed and downsampled — the dry sample never touches the oversampling
-    // filters (see the capture loop at the top), so at mix=1 (fully bypassed) this is a
+    // filter (see the capture loop at the top), so at mix=1 (fully bypassed) this is a
     // bit-exact pass-through, not an approximation. `buffer` holds the wet result now;
     // blend in the latency-aligned dry sample by however far bypassMix has ramped.
-    // fixedLatencyBaseSamples replaces the old per-factor latencySamplesFor(factor):
-    // since it never changes, this alignment is never disturbed by a factor switch.
     float finalMix = 0.0f;
     for (int n = 0; n < numBaseSamples; ++n)
     {
         bypassMix.setTargetValue(bypassed ? 1.0f : 0.0f);
         const float mix = bypassMix.getNextValue();
         finalMix = mix;
-        const juce::int64 srcAbs = baseWritePos + n - fixedLatencyBaseSamples;
+        const juce::int64 srcAbs = baseWritePos + n - totalLatencyBaseSamples;
 
         for (int ch = 0; ch < chans; ++ch)
         {
@@ -791,15 +545,14 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
 
     // Dedicated True Peak detector: independently re-analyses this exact final output
     // — after Gain, limiting, Character, the Ceiling clamp and the dry/wet crossfade,
-    // i.e. exactly what is about to reach the host — with its own fixed-factor (8x)
-    // oversampler that never shares state with the OVERSAMPLING selector's own
-    // oversamplers above. That decoupling is deliberate: metering precision must not
-    // change just because the user picked a different processing factor. The True
-    // Peak toggle still only ever decides whether this peak is allowed to *drive gain
-    // reduction* ("True Peak Limiting") — this measurement ("True Peak Meter") always
-    // reports the real reconstructed peak of whatever was actually produced, on or
-    // off, bypassed or not. Copies into a pre-allocated scratch buffer first so this
-    // can never touch what's actually sent to the host.
+    // i.e. exactly what is about to reach the host — with its own oversampler that
+    // never shares state with the DSP oversampler above. That decoupling is
+    // deliberate: metering precision is set purely by sample rate, never by anything
+    // else. This measurement ("True Peak Meter") always reports the real reconstructed
+    // peak of whatever was actually produced, on or off, bypassed or not -- the True
+    // Peak toggle only ever decides whether this peak drives gain reduction. Copies
+    // into a pre-allocated scratch buffer first so this can never touch what's
+    // actually sent to the host.
     for (int ch = 0; ch < chans; ++ch)
         dedicatedTpScratch.copyFrom(ch, 0, buffer, ch, 0, numBaseSamples);
     juce::dsp::AudioBlock<float> tpBlock(dedicatedTpScratch.getArrayOfWritePointers(), (size_t) chans, (size_t) numBaseSamples);
