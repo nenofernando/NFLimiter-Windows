@@ -98,6 +98,38 @@ namespace
         return juce::Decibels::gainToDecibels(maxAbs, -150.0f);
     }
 
+    // Same reference, but for measuring only a STEADY-STATE TAIL of a longer render:
+    // oversamples the WHOLE buffer once (so the reference filter sees the real,
+    // continuous signal, including whatever led up to the region of interest) and only
+    // searches for the peak from `startSample` onward. Copying [startSample, end) into
+    // a fresh buffer and calling independentTruePeakDb() on THAT looks equivalent but
+    // is not: it hands a brand-new Oversampling instance a signal that appears to start
+    // abruptly at full amplitude, and that instance's own cold-start/group-delay
+    // settling response to that artificial "attack" can itself ring past the ceiling --
+    // a measurement artifact of the reference, not a property of the actual audio
+    // (confirmed by hand: an apparent 0.5dB "overshoot" from the copy-then-measure
+    // pattern vanished entirely once the reference saw the untruncated buffer).
+    float independentTruePeakDbTail(const juce::AudioBuffer<float>& buf, int startSample, int stagesLog2 = 4)
+    {
+        const int chans = buf.getNumChannels();
+        juce::dsp::Oversampling<float> ref((size_t) chans, (size_t) stagesLog2,
+                                            juce::dsp::Oversampling<float>::filterHalfBandPolyphaseIIR, true, false);
+        ref.initProcessing((size_t) buf.getNumSamples());
+        juce::AudioBuffer<float> work(buf);
+        juce::dsp::AudioBlock<float> block(work);
+        auto up = ref.processSamplesUp(block);
+        const int factor = 1 << stagesLog2;
+        const size_t startIdx = (size_t) juce::jmax(0, startSample) * (size_t) factor;
+        float maxAbs = 0.0f;
+        for (size_t ch = 0; ch < (size_t) chans; ++ch)
+        {
+            auto* d = up.getChannelPointer(ch);
+            for (size_t i = startIdx; i < up.getNumSamples(); ++i)
+                if (std::isfinite(d[i])) maxAbs = juce::jmax(maxAbs, std::abs(d[i]));
+        }
+        return juce::Decibels::gainToDecibels(maxAbs, -150.0f);
+    }
+
     // FFT-based aliasing measurement: returns the fraction of total spectral energy
     // that falls OUTSIDE a narrow guard band around the fundamental, in dB relative to
     // total energy -- i.e. a single "how much spurious energy is in this signal"
@@ -443,6 +475,127 @@ int main()
         {
             info("No candidate met the tolerance everywhere -- see per-candidate worst-case numbers above.");
         }
+    }
+
+    // ------------------------------------------------------------------------------
+    // Decoupled True Peak protection: since the gain decision now comes from a
+    // dedicated, fixed-8x, feed-forward analyzer independent of the OVERSAMPLING
+    // selector (see LimiterEngine::process()), True Peak ON must keep the FINAL
+    // rendered output within ceiling + tolerance at EVERY factor, 1x included --
+    // validated here against a genuinely independent 32x reference (not the plugin's
+    // own truePeakDb(), which is a separate, already-validated detector), across
+    // sample rates, channel counts, ceilings, block sizes (including one huge
+    // "offline" single-block render), with a hard-clipped adversarial signal.
+    // ------------------------------------------------------------------------------
+    std::printf("\n-- Decoupled True Peak protection: TRUE PEAK ON vs an independent 32x reference, 1x/2x/4x/8x --\n");
+    {
+        const double sampleRates[] { 44100.0, 48000.0, 96000.0, 192000.0 };
+        const float ceilings[] { -0.1f, -1.0f, -2.0f };
+        const int factors[] { 1, 2, 4, 8 };
+        const int channelCounts[] { 1, 2 };
+        // 0.02dB detector-noise headroom (see the dedicated meter's own known 0.0311dB
+        // worst-case error) plus a small margin for genuine decimation-filter ringing:
+        // this tolerance is against the FINAL AUDIO, not the alert margin in Metering.
+        const float tolerance = 0.15f;
+        float worstOvershoot = -1000.0f;
+        char worstLabel[260] = {};
+
+        for (double sr : sampleRates)
+        {
+            for (int chans : channelCounts)
+            {
+                for (float ceilingDb : ceilings)
+                {
+                    for (int factor : factors)
+                    {
+                        const int n = (int) sr; // ~1 second
+                        auto sig = makeIntersamplePeakSignal(chans, n, sr);
+
+                        for (int blockSize : { 37, 512, n /* single "offline" block */ })
+                        {
+                            LimiterEngine engine;
+                            engine.prepare(sr, juce::jmax(blockSize, 1), chans);
+                            engine.requestOversamplingFactor(factor);
+                            engine.setParameters(0.0f, ceilingDb, 150.0f, false, LimiterEngine::Character::clean, 100.0f, true, false);
+                            auto out = runThroughInBlocks(engine, sig, blockSize);
+
+                            const int steadyStart = juce::jmin(2000, n / 4);
+                            float refPeakDb = -150.0f;
+                            for (int ch = 0; ch < chans; ++ch)
+                            {
+                                juce::AudioBuffer<float> mono(1, n);
+                                mono.copyFrom(0, 0, out, ch, 0, n);
+                                refPeakDb = juce::jmax(refPeakDb, independentTruePeakDbTail(mono, steadyStart, 5 /* 32x */));
+                            }
+                            const float overshoot = refPeakDb - ceilingDb;
+                            if (overshoot > worstOvershoot)
+                            {
+                                worstOvershoot = overshoot;
+                                std::snprintf(worstLabel, sizeof(worstLabel),
+                                    "sr=%.0f ch=%d ceiling=%.1fdBTP factor=%dx block=%d: independent 32x ref peak=%.3fdBTP (overshoot %.3fdB)",
+                                    sr, chans, (double) ceilingDb, factor, blockSize, (double) refPeakDb, (double) overshoot);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        char l[300];
+        std::snprintf(l, sizeof(l), "Worst overshoot vs independent 32x reference, TRUE PEAK ON, across sr x ch x ceiling x 1x/2x/4x/8x x block size: %.4f dB (tolerance %.2fdB) -- %s",
+                      (double) worstOvershoot, (double) tolerance, worstLabel);
+        check(worstOvershoot <= tolerance, l);
+    }
+
+    // ------------------------------------------------------------------------------
+    // Excess attenuation: on a stable signal safely under ceiling, True Peak ON must
+    // not attenuate meaningfully more than True Peak OFF does for the same material --
+    // the dedicated analyzer's own Gibbs-ringing headroom on adversarial content must
+    // not turn into audible extra gain reduction on ordinary, non-adversarial program
+    // material. Uses a simple full-scale-ish sine (no intersample surprises) well
+    // inside the ceiling.
+    // ------------------------------------------------------------------------------
+    std::printf("\n-- Excess attenuation: TRUE PEAK ON vs OFF on stable, non-adversarial material --\n");
+    {
+        const double sr = 48000.0;
+        const int n = (int) sr;
+        const float ceilingDb = -1.0f;
+        float worstExtraAttenDb = -1000.0f;
+        char worstLabel[220] = {};
+
+        for (int factor : { 1, 2, 4, 8 })
+        {
+            for (int chans : { 1, 2 })
+            {
+                auto sig = makeSine(chans, n, sr, 1000.0, 0.7f); // ~ -3dBFS, comfortably under -1dBTP ceiling
+
+                auto render = [&](bool tpOn)
+                {
+                    LimiterEngine engine;
+                    engine.prepare(sr, 512, chans);
+                    engine.requestOversamplingFactor(factor);
+                    engine.setParameters(0.0f, ceilingDb, 150.0f, false, LimiterEngine::Character::clean, 100.0f, tpOn, false);
+                    return runThroughInBlocks(engine, sig, 512);
+                };
+
+                auto onOut = render(true);
+                auto offOut = render(false);
+                const int skip = 4000;
+                float maxAbsDiff = 0.0f;
+                for (int ch = 0; ch < chans; ++ch)
+                    for (int i = skip; i < n; ++i)
+                        maxAbsDiff = juce::jmax(maxAbsDiff, std::abs(onOut.getSample(ch, i) - offOut.getSample(ch, i)));
+                const float extraAttenDb = juce::Decibels::gainToDecibels(1.0f + maxAbsDiff, -150.0f);
+                if (extraAttenDb > worstExtraAttenDb)
+                {
+                    worstExtraAttenDb = extraAttenDb;
+                    std::snprintf(worstLabel, sizeof(worstLabel), "factor=%dx ch=%d: max ON-vs-OFF sample diff=%.6f (~%.4fdB)",
+                                  factor, chans, (double) maxAbsDiff, (double) extraAttenDb);
+                }
+            }
+        }
+        char l[260];
+        std::snprintf(l, sizeof(l), "Worst TRUE PEAK ON-vs-OFF difference on stable material, 1x/2x/4x/8x, mono/stereo: %s (must stay well under 0.5dB)", worstLabel);
+        check(worstExtraAttenDb < 0.5f, l);
     }
 
     std::printf("\n== %d failure(s) ==\n", failures);

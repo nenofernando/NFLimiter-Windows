@@ -86,7 +86,6 @@ void Metering::captureOutput(const juce::AudioBuffer<float>& b, float grDb, floa
     outL = peakDb(b, 0);
     outR = peakDb(b, juce::jmin(1, b.getNumChannels() - 1));
     gr = grDb;
-    truePeak = truePeakDbIn;
 
     // TRUE PEAK OVER is an overload-vs-ceiling indicator (never a clipper control): it
     // lights when the SAME dedicated-detector reading shown on the True Peak card
@@ -94,13 +93,18 @@ void Metering::captureOutput(const juce::AudioBuffer<float>& b, float grDb, floa
     // output — see LimiterEngine::truePeakDb()) exceeds the *current* ceiling by more
     // than a hair, holds so a fast transient is actually seen, then clears on its own.
     // A new over during an active hold re-triggers the full hold (jmax below). Bypass
-    // always wins: no leftover latch can glow through it.
-    static constexpr float kClipMarginDb = 0.02f;
+    // always wins: no leftover latch can glow through it. The margin is sized against
+    // the dedicated 8x detector's own known worst-case error (0.0311dB vs an
+    // independent 32x reference, see oversampling_audit.cpp) so the detector's own
+    // reconstruction noise alone can never cross it. This margin affects only the
+    // alert -- it never feeds the ceiling or the limiting engine.
+    static constexpr float kClipMarginDb = 0.05f;
     static constexpr double kClipHoldSeconds = 1.5;
     if (bypassed)
     {
         clipHoldSamplesRemaining = 0;
         clipped = false;
+        truePeak = truePeakDbIn; // no retained value survives Bypass
     }
     else
     {
@@ -109,6 +113,12 @@ void Metering::captureOutput(const juce::AudioBuffer<float>& b, float grDb, floa
         else
             clipHoldSamplesRemaining = juce::jmax(0, clipHoldSamplesRemaining - b.getNumSamples());
         clipped = clipHoldSamplesRemaining > 0;
+
+        // The TRUE PEAK card shows the peak responsible for the current over while the
+        // light is held (growing if a still-bigger peak arrives during the hold), then
+        // resumes following the live measurement the instant the hold ends -- so the
+        // number and the light never visually disagree about what triggered it.
+        truePeak = clipped ? juce::jmax(truePeak.load(), truePeakDbIn) : truePeakDbIn;
     }
 
     const int n = b.getNumSamples();

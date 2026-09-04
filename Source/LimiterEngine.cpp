@@ -37,6 +37,49 @@ void LimiterEngine::prepare(double sampleRate, int maximumBlockSize, int newNumC
     dedicatedTpOversampler->initProcessing((size_t) juce::jmax(1, maximumBlockSize));
     dedicatedTpScratch.setSize(numChannels, juce::jmax(1, maximumBlockSize), false, false, true);
 
+    // FIR equiripple (linear-phase), not polyphase IIR: see the class-level comment on
+    // dedicatedTpGainOversampler for why this filter family is required here.
+    dedicatedTpGainOversampler = std::make_unique<juce::dsp::Oversampling<float>>(
+        (size_t) numChannels, (size_t) kDedicatedTpGainStages,
+        juce::dsp::Oversampling<float>::filterHalfBandFIREquiripple, true, true);
+    dedicatedTpGainOversampler->initProcessing((size_t) juce::jmax(1, maximumBlockSize));
+    dedicatedTpGainScratch.setSize(numChannels, juce::jmax(1, maximumBlockSize), false, false, true);
+
+    // getLatencyInSamples() reports the round-trip up+down latency, but this analyzer
+    // only ever calls processSamplesUp (feed-forward, never downsamples), so its real
+    // delay is shorter and must be measured directly: an independent, throwaway
+    // Oversampling instance (so it can't disturb the real member's filter state or care
+    // about maximumBlockSize's own processing-size contract) is fed a single impulse,
+    // and the delay is however far the reconstructed peak lands from where a
+    // zero-delay filter would have put it. Measured once, here, never in process(). This
+    // filter is linear-phase, so this single measurement (taken with a broadband
+    // impulse) is exact at every frequency, not just the one the impulse happens to
+    // emphasise -- unlike polyphase IIR, whose group delay varies with frequency.
+    {
+        juce::dsp::Oversampling<float> calibOs(1, (size_t) kDedicatedTpGainStages,
+            juce::dsp::Oversampling<float>::filterHalfBandFIREquiripple, true, true);
+        const int calibN = 1024;
+        calibOs.initProcessing((size_t) calibN);
+        juce::AudioBuffer<float> calib(1, calibN);
+        calib.clear();
+        const int impulsePos = calibN / 4;
+        calib.setSample(0, impulsePos, 1.0f);
+        juce::dsp::AudioBlock<float> calibBlock(calib);
+        auto calibUp = calibOs.processSamplesUp(calibBlock);
+        int peakIdx = 0;
+        float peakVal = 0.0f;
+        auto* up0 = calibUp.getChannelPointer(0);
+        for (size_t i = 0; i < calibUp.getNumSamples(); ++i)
+        {
+            const float v = std::abs(up0[i]);
+            if (v > peakVal) { peakVal = v; peakIdx = (int) i; }
+        }
+        const double delayOsSamples = (double) peakIdx - (double) impulsePos * kGainAnalysisFactor;
+        dedicatedTpGainLatencyOsSamples = juce::jmax(0, (int) std::round(delayOsSamples));
+        dedicatedTpGainLatencyBaseSamples = juce::jmax(0, (int) std::round(delayOsSamples / (double) kGainAnalysisFactor));
+    }
+    inputGainRampScratch.assign((size_t) juce::jmax(1, maximumBlockSize), 1.0f);
+
     // Unlike the wet path's lookahead ring (where read trails write by a bounded
     // lookaheadOs at all times, interleaved sample-by-sample), the dry path writes an
     // entire block and then reads it back in a second pass — so the ring must hold at
@@ -47,10 +90,30 @@ void LimiterEngine::prepare(double sampleRate, int maximumBlockSize, int newNumC
         maxTotalLatency = juce::jmax(maxTotalLatency, lookaheadBaseSamples + osLatencyBaseSamples[(size_t) i]);
     dryDelayCapacity = maxTotalLatency + juce::jmax(1, maxBlockSize) + 64;
 
+    // The dedicated gain analyzer's own delay must fit inside the existing 5ms
+    // lookahead, or a base sample's true-peak-aware gain decision would need audio that
+    // has already been emitted -- verified here (and by the latency-compliance tests),
+    // not assumed. If this ever trips, the fix is a longer lookahead, not silently
+    // truncating the compensation.
+    jassert(dedicatedTpGainLatencyBaseSamples <= lookaheadBaseSamples);
+
+    // Rounded up to a power of two so every ring index below is a single AND against
+    // tp8xPeakRingCapacityMask instead of an integer division: this ring is indexed
+    // twice per dedicated-oversampled tick (write once per block, read once per main
+    // loop tick), so at 192kHz/8x that is tens of thousands of indexing operations per
+    // second per channel -- measured to be a significant, avoidable share of this
+    // analyzer's CPU cost with a non-power-of-two modulus.
+    const int gainFactorForRing = 1 << kDedicatedTpGainStages;
+    const int minRingCapacityNeeded = dryDelayCapacity * gainFactorForRing;
+    tp8xPeakRingCapacity = 1;
+    while (tp8xPeakRingCapacity < minRingCapacityNeeded) tp8xPeakRingCapacity <<= 1;
+    tp8xPeakRingMask = tp8xPeakRingCapacity - 1;
+
     for (auto& cs : channelState)
     {
         cs.delay.assign((size_t) delayCapacity, 0.0f);
         cs.dryBaseDelay.assign((size_t) dryDelayCapacity, 0.0f);
+        cs.tp8xPeakRing.assign((size_t) tp8xPeakRingCapacity, 0.0f);
         cs.minIdxRing.assign((size_t) minRingCapacity, (juce::int64) 0);
         cs.minValRing.assign((size_t) minRingCapacity, 0.0f);
     }
@@ -60,6 +123,7 @@ void LimiterEngine::prepare(double sampleRate, int maximumBlockSize, int newNumC
     pendingOsFactor.store(wanted);
 
     inputGainSmoothed.reset(baseSampleRate, 0.02);
+    inputGainSmoothedBaseRate.reset(baseSampleRate, 0.02);
     ceilingSmoothed.reset(baseSampleRate, 0.02);
     stereoLinkSmoothed.reset(baseSampleRate, 0.02);
     truePeakBlend.reset(baseSampleRate, 0.02);
@@ -69,6 +133,7 @@ void LimiterEngine::prepare(double sampleRate, int maximumBlockSize, int newNumC
     // even at ~30Hz) to smooth over the wet/dry level jump.
     bypassMix.reset(baseSampleRate, 0.03); // base rate — the dry crossfade runs post-downsample
     inputGainSmoothed.setCurrentAndTargetValue(1.0f);
+    inputGainSmoothedBaseRate.setCurrentAndTargetValue(1.0f);
     ceilingSmoothed.setCurrentAndTargetValue(0.89125f);
     stereoLinkSmoothed.setCurrentAndTargetValue(1.0f);
     bypassMix.setCurrentAndTargetValue(0.0f);
@@ -84,10 +149,12 @@ void LimiterEngine::reset()
     {
         std::fill(cs.delay.begin(), cs.delay.end(), 0.0f);
         std::fill(cs.dryBaseDelay.begin(), cs.dryBaseDelay.end(), 0.0f);
+        std::fill(cs.tp8xPeakRing.begin(), cs.tp8xPeakRing.end(), 0.0f);
         cs.minHead = 0; cs.minCount = 0; cs.currentGain = 1.0f; cs.heldDigitalPeak = 0.0f;
     }
     for (auto& os : oversamplers) if (os) os->reset();
     if (dedicatedTpOversampler) dedicatedTpOversampler->reset();
+    if (dedicatedTpGainOversampler) dedicatedTpGainOversampler->reset();
     currentGrDb.store(0.0f);
 }
 
@@ -102,23 +169,32 @@ void LimiterEngine::switchToPendingFactorIfNeeded()
     {
         std::fill(cs.delay.begin(), cs.delay.end(), 0.0f);
         std::fill(cs.dryBaseDelay.begin(), cs.dryBaseDelay.end(), 0.0f);
+        std::fill(cs.tp8xPeakRing.begin(), cs.tp8xPeakRing.end(), 0.0f);
         cs.minHead = 0; cs.minCount = 0; cs.currentGain = 1.0f; cs.heldDigitalPeak = 0.0f;
     }
     const int idx = factorToIndex(wanted);
     if (oversamplers[(size_t) idx]) oversamplers[(size_t) idx]->reset();
+    // The dedicated True Peak gain analyzer is fixed at 8x and deliberately untouched by
+    // the OVERSAMPLING selector's own factor -- its precision must not change just
+    // because the user picked a different quality factor. Its filter state is reset here
+    // purely for cleanliness alongside the ring/index reset above (baseWritePos restarts
+    // at 0, so any stale ring content indexed under the old numbering must go too).
+    if (dedicatedTpGainOversampler) dedicatedTpGainOversampler->reset();
 
     const double osRate = baseSampleRate * (double) wanted;
     inputGainSmoothed.reset(osRate, 0.02);
     ceilingSmoothed.reset(osRate, 0.02);
     stereoLinkSmoothed.reset(osRate, 0.02);
     truePeakBlend.reset(osRate, 0.02);
-    // bypassMix runs at the base rate and is unaffected by the oversampling factor.
+    // bypassMix and inputGainSmoothedBaseRate run at the fixed base rate and are
+    // unaffected by the oversampling factor.
 }
 
 void LimiterEngine::setParameters(float inputGainDb, float ceilingDbTP, float releaseMsIn, bool autoReleaseIn,
                                    Character characterIn, float stereoLinkPercent, bool truePeakIn, bool bypassedIn)
 {
     inputGainSmoothed.setTargetValue(juce::Decibels::decibelsToGain(inputGainDb));
+    inputGainSmoothedBaseRate.setTargetValue(juce::Decibels::decibelsToGain(inputGainDb));
     ceilingSmoothed.setTargetValue(juce::Decibels::decibelsToGain(ceilingDbTP));
     // stereoLinkPercent arrives as 0-100 (the "stereo_link" APVTS parameter's own
     // range, shown to the user as "N %"), but stereoLinkSmoothed is a normalised 0-1
@@ -209,6 +285,63 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
         }
     }
 
+    // Dedicated True Peak GAIN-DRIVING analysis: fixed 8x, feed-forward, decoupled from
+    // the OVERSAMPLING selector's own factor -- so True Peak Limiting protects equally
+    // at 1x/2x/4x/8x instead of only where the main quality oversampler happens to
+    // provide enough intersample resolution on its own. Runs on the GAINED signal (post
+    // input gain, the only stage between raw input and this analysis point) at a fixed
+    // rate that never changes with `factor`. Skipped entirely while True Peak is fully
+    // off (blend at rest on 0, current call and target both) to save CPU; only reads
+    // pre-sized buffers either way, so it never allocates.
+    const bool needsTpGainAnalysis = truePeakBlend.getTargetValue() > 1.0e-6f
+                                    || truePeakBlend.getCurrentValue() > 1.0e-6f;
+    if (needsTpGainAnalysis)
+    {
+        for (int n = 0; n < numBaseSamples; ++n)
+            inputGainRampScratch[(size_t) n] = inputGainSmoothedBaseRate.getNextValue();
+
+        for (int ch = 0; ch < chans; ++ch)
+        {
+            auto* d = buffer.getReadPointer(ch);
+            auto* g = dedicatedTpGainScratch.getWritePointer(ch);
+            for (int n = 0; n < numBaseSamples; ++n)
+            {
+                float raw = d[n];
+                if (! std::isfinite(raw)) raw = 0.0f;
+                g[n] = raw * inputGainRampScratch[(size_t) n];
+            }
+        }
+
+        juce::dsp::AudioBlock<float> gainBlock(dedicatedTpGainScratch.getArrayOfWritePointers(),
+                                                (size_t) chans, (size_t) numBaseSamples);
+        auto gainOs = dedicatedTpGainOversampler->processSamplesUp(gainBlock);
+
+        // Store every dedicated-oversampled tick's |value| individually (not a
+        // per-base-sample max) so the main loop below can give each of its own ticks a
+        // correspondingly fine slice when factor < 8, instead of collapsing all `factor`
+        // sub-ticks of a base sample to one held value -- at factor==8 that would have
+        // quietly thrown away the native per-tick resolution the old (coupled) code had.
+        for (int ch = 0; ch < chans; ++ch)
+        {
+            auto& cs = channelState[(size_t) ch];
+            auto* up = gainOs.getChannelPointer((size_t) ch);
+            const juce::int64 baseOsIdx = baseWritePos * kGainAnalysisFactor;
+            for (size_t k = 0; k < gainOs.getNumSamples(); ++k)
+            {
+                float v = std::abs(up[k]);
+                if (! std::isfinite(v)) v = 0.0f;
+                cs.tp8xPeakRing[(size_t) ((baseOsIdx + (juce::int64) k) & tp8xPeakRingMask)] = v;
+            }
+        }
+    }
+    else
+    {
+        // Keep the base-rate gain ramp in sync with the real (not-yet-consumed) target
+        // so re-enabling True Peak later doesn't jump: advance the same number of steps
+        // the loop above would have, without doing the per-sample work.
+        inputGainSmoothedBaseRate.skip(numBaseSamples);
+    }
+
     juce::dsp::AudioBlock<float> block(buffer);
     juce::dsp::AudioBlock<float> osBlock = block;
     if (factor > 1 && oversamplers[(size_t) idx] != nullptr)
@@ -239,10 +372,49 @@ void LimiterEngine::process(juce::AudioBuffer<float>& buffer)
 
             const float instantAbs = std::abs(xGained);
             if ((writePos % factor) == 0) cs.heldDigitalPeak = instantAbs;
+
+            // The True-Peak-on candidate comes from the dedicated, fixed-8x,
+            // feed-forward analyzer (decoupled from `factor`) rather than this main
+            // factor's own `instantAbs`, so True Peak protection no longer depends on
+            // which OVERSAMPLING quality factor is selected. True Peak off is completely
+            // unaffected: heldDigitalPeak's own source and update timing are unchanged
+            // above. `factor` always evenly divides kGainAnalysisFactor (1/2/4/8 divide
+            // 8), so each of this base sample's `factor` main-loop ticks maps onto its
+            // own equal-sized slice of the analyzer's 8 sub-samples for that base sample
+            // -- at factor==8 that is one dedicated sample per tick (matching the native
+            // per-tick resolution the old, coupled code had); at lower factors, this
+            // tick's slice is reduced by max (never held constant across the whole base
+            // sample), which is strictly finer than the old per-base-sample coupling.
+            float tpOnCandidate = instantAbs;
+            if (needsTpGainAnalysis)
+            {
+                const int nBase = i / factor;
+                const int iWithinBase = i - nBase * factor;
+                const int subPerTick = kGainAnalysisFactor / factor;
+                const juce::int64 baseOsIdx = (baseWritePos + nBase) * kGainAnalysisFactor
+                                             + iWithinBase * subPerTick - dedicatedTpGainLatencyOsSamples;
+                // During the analyzer's own warm-up (the first ~39 base samples after
+                // prepare()/reset()/a factor switch, before the delay-compensated ring
+                // position becomes valid), baseOsIdx is negative: fall back to
+                // instantAbs -- this factor's own immediate estimate, exactly what fed
+                // the gain decision before this analyzer existed -- rather than 0.0f,
+                // which would silently zero the True-Peak-on candidate for that whole
+                // window (with truePeakBlend starting at 1.0, that suppressed real,
+                // legitimate cold-start gain reduction; verified bit-identical to a
+                // pre-decoupling reference with this fallback, diverging without it).
+                float m = instantAbs;
+                if (baseOsIdx >= 0)
+                {
+                    m = 0.0f;
+                    for (int k = 0; k < subPerTick; ++k)
+                        m = juce::jmax(m, cs.tp8xPeakRing[(size_t) ((baseOsIdx + k) & tp8xPeakRingMask)]);
+                }
+                tpOnCandidate = m;
+            }
             // Blended rather than hard-switched: toggling True Peak mid-playback ramps
             // between the two detector sources instead of handing the lookahead window
             // a discontinuous target on a single sample (see truePeakBlend above).
-            peak[ch] = cs.heldDigitalPeak + tpBlendNow * (instantAbs - cs.heldDigitalPeak);
+            peak[ch] = cs.heldDigitalPeak + tpBlendNow * (tpOnCandidate - cs.heldDigitalPeak);
         }
 
         // Stereo Link interpolates in the dB gain-reduction domain, not the linear peak

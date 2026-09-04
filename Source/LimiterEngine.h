@@ -73,6 +73,10 @@ private:
         int minHead = 0, minCount = 0;
         float currentGain = 1.0f;
         float heldDigitalPeak = 0.0f;            // last sample-grid peak, used when True Peak is off
+        // Per-dedicated-oversampled-tick (8 entries per base-rate sample) ring of the
+        // feed-forward analyzer's |output|, delay-compensated on read -- see
+        // dedicatedTpGainLatencyBaseSamples and needsTpGainAnalysis in process().
+        std::vector<float> tp8xPeakRing;
     };
 
     static void pushMin(ChannelState& cs, juce::int64 idx, float value, int ringCapacity) noexcept;
@@ -104,12 +108,51 @@ private:
     std::unique_ptr<juce::dsp::Oversampling<float>> dedicatedTpOversampler;
     juce::AudioBuffer<float> dedicatedTpScratch;
 
+    // Dedicated True Peak GAIN-DRIVING analyzer -- a THIRD independent oversampler,
+    // separate from both the quality oversamplers array above (which the OVERSAMPLING
+    // selector controls, for sonic/Character quality only) and dedicatedTpOversampler
+    // above (which only measures the FINAL output for the meter/light, feedback-style,
+    // after everything has already happened). This one runs FEED-FORWARD, fixed at 8x
+    // regardless of the OVERSAMPLING selector, on the gained (post input-gain,
+    // pre-limiting, pre-Character) signal, so the gain computation itself always sees
+    // genuine 8x intersample resolution -- True Peak Limiting no longer depends on
+    // which factor the user picked for processing quality/CPU.
+    //
+    // Deliberately FIR equiripple (linear-phase), not the polyphase IIR used by the
+    // measurement detector above: a feed-forward detector's output gets consumed at a
+    // delay-compensated position, and that compensation is only exact if the group
+    // delay is the SAME at every frequency. Polyphase IIR's group delay varies with
+    // frequency (measured: a single-constant compensation left a real, ~0.1dB, steady-
+    // state ceiling overshoot on near-Nyquist content); FIR equiripple's group delay is
+    // constant by construction, so one measured constant (~39 base-rate samples,
+    // measured via an impulse in prepare(), never assumed) compensates it exactly at
+    // every frequency. That delay is comfortably inside the 5ms lookahead at every
+    // supported sample rate (44.1kHz's ~220-sample lookahead is the tightest case), so
+    // the reported plugin latency does not need to grow for this.
+    //
+    // Skipped entirely when True Peak is fully off (see needsTpGainAnalysis in
+    // process()) to save CPU; its buffers are still fully preallocated in prepare()
+    // either way, so toggling True Peak never allocates or reconfigures anything.
+    static constexpr int kDedicatedTpGainStages = 3; // 2^3 = 8x
+    static constexpr int kGainAnalysisFactor = 1 << kDedicatedTpGainStages;
+    std::unique_ptr<juce::dsp::Oversampling<float>> dedicatedTpGainOversampler;
+    juce::AudioBuffer<float> dedicatedTpGainScratch;
+    int dedicatedTpGainLatencyBaseSamples = 0;  // rounded to whole base samples, for the lookahead-fit check
+    int dedicatedTpGainLatencyOsSamples = 0;    // rounded to whole dedicated-oversampled ticks, for compensation
+    std::vector<float> inputGainRampScratch;
+    // Mirrors inputGainSmoothed's target but ramps at the fixed base rate (never reset
+    // by switchToPendingFactorIfNeeded, unlike inputGainSmoothed) -- it exists purely to
+    // feed the dedicated analyzer above, which runs upstream of any oversampling.
+    juce::SmoothedValue<float> inputGainSmoothedBaseRate;
+
     std::array<ChannelState, 2> channelState;
     int delayCapacity = 0;
     int minRingCapacity = 0;
     juce::int64 writePos = 0, readPos = 0;
 
     int dryDelayCapacity = 0;
+    int tp8xPeakRingCapacity = 0; // next power of two >= dryDelayCapacity * kGainAnalysisFactor
+    juce::int64 tp8xPeakRingMask = 0; // tp8xPeakRingCapacity - 1, for index & mask instead of index % capacity
     juce::int64 baseWritePos = 0;
 
     juce::SmoothedValue<float> inputGainSmoothed, ceilingSmoothed, stereoLinkSmoothed;

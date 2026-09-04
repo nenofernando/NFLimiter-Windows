@@ -686,22 +686,22 @@ namespace
     {
         const float ceilingDbTP = -1.0f;
 
-        // A wider-separated tone pair than makeIntersamplePeakSignal's default: swept
-        // empirically to give a robust (>0.15dB clear of the trigger margin), sample-rate-
-        // independent OFF-over / ON-dark separation at factor=4x and 8x. At factor=1x there
-        // is no oversampling filter in the main signal path at all, so True Peak Limiting
-        // cannot act (see the factor==1 special case below); at factor=2x the reconstruction
-        // filter has too little resolution above the base-rate grid to meaningfully separate
-        // ON from OFF for adversarial content -- verified by direct sample comparison (the
-        // two outputs differ by <2e-6 in the linear domain for this class of signal, an order
-        // of magnitude below anything the 0.02dB trigger margin could ever resolve). Neither
-        // of those is an indicator bug: both are genuine, reproducible properties of how much
-        // intersample detail each oversampling factor can actually reconstruct, and rule #9
-        // forbids changing the True Peak detector or the limiting engine to alter that.
-        auto makeStressSignal = [](int channels, int n, double sr)
+        // Now that True Peak Limiting's gain decision comes from a dedicated, fixed-8x,
+        // feed-forward analyzer decoupled from the OVERSAMPLING factor (see
+        // LimiterEngine::process()), ON genuinely protects at every factor, including
+        // 1x/2x where the main quality oversampler alone used to provide too little (or
+        // no) intersample resolution. What remains factor-dependent is only whether a
+        // GIVEN OFF-mode stimulus happens to produce a decimated-grid peak that already
+        // tracks that factor's true peak closely (no overshoot to protect against in the
+        // first place) -- a property of where a fixed test tone's phase lands on each
+        // factor's own sample grid, not of the protection itself. 0.23/0.45fs stresses
+        // 1x/4x/8x robustly; 2x needs a different pair (swept empirically) since at 2x
+        // the 0.23/0.45 pair's OFF-mode decimated peak already closely tracks its true
+        // peak for this specific tone spacing.
+        auto makeStressSignal = [](int channels, int n, double sr, double f1frac, double f2frac)
         {
             juce::AudioBuffer<float> b(channels, n);
-            const double f1 = sr * 0.23, f2 = sr * 0.45;
+            const double f1 = sr * f1frac, f2 = sr * f2frac;
             for (int ch = 0; ch < channels; ++ch)
                 for (int i = 0; i < n; ++i)
                 {
@@ -713,7 +713,7 @@ namespace
             return b;
         };
 
-        auto render = [&](bool truePeakOn, double sr, int chans, int factor)
+        auto render = [&](bool truePeakOn, double sr, int chans, int factor, double f1frac, double f2frac)
         {
             LimiterEngine engine;
             Metering meter;
@@ -722,7 +722,7 @@ namespace
             engine.requestOversamplingFactor(factor);
             meter.prepare(sr, chans);
             engine.setParameters(0.0f, ceilingDbTP, 150.0f, true, LimiterEngine::Character::clean, 100.0f, truePeakOn, false);
-            auto sig = makeStressSignal(chans, n, sr);
+            auto sig = makeStressSignal(chans, n, sr, f1frac, f2frac);
             juce::AudioBuffer<float> out(sig);
             int pos = 0;
             bool sawOver = false;
@@ -734,8 +734,8 @@ namespace
                 meter.captureOutput(chunk, engine.gainReductionDb(), engine.truePeakDb(), ceilingDbTP, false);
                 // Rule: the light's trigger must be exactly the same detector value as
                 // the number shown on the card -- assert that equivalence on every call.
-                const bool expectedOver = engine.truePeakDb() > ceilingDbTP + 0.02f;
-                if (expectedOver) check(meter.get().clip || meter.get().truePeak > ceilingDbTP + 0.02f - 1.0e-4f,
+                const bool expectedOver = engine.truePeakDb() > ceilingDbTP + 0.05f;
+                if (expectedOver) check(meter.get().clip || meter.get().truePeak > ceilingDbTP + 0.05f - 1.0e-4f,
                     "light state derives from the exact same truePeakDb() value as the displayed number");
                 if (meter.get().clip) sawOver = true;
                 pos += bs;
@@ -744,12 +744,17 @@ namespace
         };
 
         // Single-config sanity (matches the original Teste A/B from the True Peak audit).
-        check(render(false, 48000.0, 2, 4) == true, "TRUE PEAK OVER lights during Teste A (OFF) when the reconstructed peak exceeds Ceiling");
-        check(render(true, 48000.0, 2, 4) == false, "TRUE PEAK OVER stays dark during Teste B (ON), true peak held at/under Ceiling");
+        check(render(false, 48000.0, 2, 4, 0.23, 0.45) == true, "TRUE PEAK OVER lights during Teste A (OFF) when the reconstructed peak exceeds Ceiling");
+        check(render(true, 48000.0, 2, 4, 0.23, 0.45) == false, "TRUE PEAK OVER stays dark during Teste B (ON), true peak held at/under Ceiling");
 
         // Full matrix requested by the audit: 44.1/48/96/192kHz x mono/stereo x
         // 1x/2x/4x/8x, True Peak ON and OFF, confirming the indicator (and its
-        // agreement with the metered number) holds everywhere.
+        // agreement with the metered number) holds everywhere. factor==2 uses a
+        // different tone pair (swept empirically) since 0.23/0.45's OFF-mode decimated
+        // peak happens to already track its true peak closely at exactly this factor --
+        // a property of this fixed tone pair's phase on that one factor's sample grid,
+        // not of the protection (which the A/B-verified gain-decision fix makes real at
+        // every factor now).
         std::printf("  Full matrix (sr x channels x factor x TruePeak on/off):\n");
         for (double sr : { 44100.0, 48000.0, 96000.0, 192000.0 })
         {
@@ -757,27 +762,14 @@ namespace
             {
                 for (int factor : { 1, 2, 4, 8 })
                 {
-                    const bool overWhenOff = render(false, sr, chans, factor);
-                    const bool overWhenOn = render(true, sr, chans, factor);
+                    const double f1frac = factor == 2 ? 0.28 : 0.23;
+                    const double f2frac = factor == 2 ? 0.36 : 0.45;
+                    const bool overWhenOff = render(false, sr, chans, factor, f1frac, f2frac);
+                    const bool overWhenOn = render(true, sr, chans, factor, f1frac, f2frac);
                     char l[220];
                     std::snprintf(l, sizeof(l), "sr=%.0f ch=%d factor=%dx: OFF lights=%s, ON stays dark=%s",
                                   sr, chans, factor, overWhenOff ? "yes" : "NO", ! overWhenOn ? "yes" : "NO");
-                    // factor=1x: no oversampling filter at all in the main path, so ON and
-                    // OFF drive gain reduction from the exact same sample-grid peak
-                    // (heldDigitalPeak == instantAbs whenever writePos % factor == 0, which
-                    // is every sample at factor=1) -- only the OFF-mode overshoot is
-                    // meaningful here, not an ON-vs-OFF distinction that can't exist.
-                    // factor=2x: the halfband reconstruction filter has too little
-                    // resolution above the base-rate grid to meaningfully separate ON from
-                    // OFF for adversarial content (verified: <2e-6 linear-domain difference
-                    // between the two output buffers for this signal, reproducibly, at
-                    // every sample rate), so neither an OFF-over nor an ON-dark outcome is
-                    // guaranteed here -- only the light-vs-truePeakDb() consistency
-                    // invariant (checked above, every call) is meaningful at this factor.
-                    if (factor == 1)
-                        check(overWhenOff, l);
-                    else if (factor != 2)
-                        check(overWhenOff && ! overWhenOn, l);
+                    check(overWhenOff && ! overWhenOn, l);
                 }
             }
         }
@@ -870,10 +862,17 @@ namespace
         for (int i = 0; i < 500; ++i) m.captureOutput(quiet, 0.0f, -0.4f, ceilingDb, false);
         check(! m.get().clip, "TRUE PEAK OVER stays off across 500 calls with TP=-0.4dBTP, ceiling=-0.1dBTP (well under threshold)");
 
-        // -- 2. TP above ceiling+0.02dB for a single call: must light and hold ----
+        // -- 2. TP above ceiling+0.05dB for a single call: must light and hold ----
+        // Margin is 0.05dB (not the stricter 0.02dB first tried): the dedicated 8x
+        // detector's own worst-case error against an independent 32x reference is
+        // 0.0311dB (see oversampling_audit.cpp), so 0.02dB was smaller than the
+        // detector's own measurement noise -- capable of false-triggering on the
+        // detector's reconstruction error alone, not a real overshoot. 0.05dB keeps
+        // comfortable headroom above that known error while staying sensitive to real
+        // overs. This margin affects only the alert, never the ceiling or the limiter.
         m.reset();
-        m.captureOutput(quiet, 0.0f, ceilingDb + 0.03f, ceilingDb, false); // exceeds by 0.03 > 0.02dB margin
-        check(m.get().clip, "TRUE PEAK OVER turns on the instant TP exceeds ceiling+0.02dB, even for a single call");
+        m.captureOutput(quiet, 0.0f, ceilingDb + 0.08f, ceilingDb, false); // exceeds by 0.08 > 0.05dB margin
+        check(m.get().clip, "TRUE PEAK OVER turns on the instant TP exceeds ceiling+0.05dB, even for a single call");
 
         // Immediately back under ceiling: must still hold (not blink off instantly).
         m.captureOutput(quiet, 0.0f, -6.0f, ceilingDb, false);
@@ -904,7 +903,7 @@ namespace
         // -- 4. A new over during an active hold restarts the full 1.5s ----------
         {
             m.reset();
-            m.captureOutput(quiet, 0.0f, ceilingDb + 0.03f, ceilingDb, false); // trigger #1
+            m.captureOutput(quiet, 0.0f, ceilingDb + 0.08f, ceilingDb, false); // trigger #1
             check(m.get().clip, "(setup) trigger #1 lights TRUE PEAK OVER");
 
             const int stepSamples = 64;
@@ -915,7 +914,7 @@ namespace
             check(m.get().clip, "(setup) still within trigger #1's hold at ~1.0s in");
 
             // A second over now must reset the hold to a fresh 1.5s from THIS point.
-            m.captureOutput(quiet, 0.0f, ceilingDb + 0.03f, ceilingDb, false); // trigger #2
+            m.captureOutput(quiet, 0.0f, ceilingDb + 0.08f, ceilingDb, false); // trigger #2
             elapsed += stepSamples;
             check(m.get().clip, "(setup) trigger #2 re-lights TRUE PEAK OVER");
 
@@ -933,9 +932,9 @@ namespace
 
         // -- 5. Bypass forces it off immediately, never a stale latch -------------
         m.reset();
-        m.captureOutput(quiet, -2.0f, ceilingDb + 0.03f, ceilingDb, false);
+        m.captureOutput(quiet, -2.0f, ceilingDb + 0.08f, ceilingDb, false);
         check(m.get().clip, "(setup) TRUE PEAK OVER is latched on before the bypass check");
-        m.captureOutput(quiet, 0.0f, ceilingDb + 0.03f, ceilingDb, true); // bypass engaged mid-overload
+        m.captureOutput(quiet, 0.0f, ceilingDb + 0.08f, ceilingDb, true); // bypass engaged mid-overload
         check(! m.get().clip, "TRUE PEAK OVER is forced off the instant Bypass engages, no stale latch");
     }
 
